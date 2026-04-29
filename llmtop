@@ -364,9 +364,7 @@ def collect(prev: dict, dt: float) -> dict:
     }
 
 
-def build_layout(
-    snap: dict, procs: list[dict], models: list[dict], patterns: list[str]
-) -> Layout:
+def build_layout(snap: dict, procs: list[dict], models: list[dict]) -> Layout:
     vm = snap["vm"]
     swap = snap["swap"]
     total = psutil.virtual_memory().total
@@ -488,29 +486,23 @@ def build_layout(
     footer = Text("ctrl-c to quit", justify="right", style="dim")
     models_size = max(4, min(12, len(models) + 4))
 
+    title = lambda s: f"[bold white]{s}[/]"
     layout = Layout()
     layout.split_column(
         Layout(
-            Panel(sys_t, title="System Memory", border_style="cyan"),
+            Panel(sys_t, title=title("System Memory"), border_style="cyan"),
             size=6, name="system",
         ),
         Layout(
-            Panel(pressure_t, title="Memory Pressure", border_style="yellow"),
+            Panel(pressure_t, title=title("Memory Pressure"), border_style="yellow"),
             size=5, name="pressure",
         ),
         Layout(
-            Panel(models_t, title="Active Models", border_style="green"),
+            Panel(models_t, title=title("Active Models"), border_style="green"),
             size=models_size, name="models",
         ),
         Layout(
-            Panel(
-                proc_t,
-                title=(
-                    f"[bold cyan]Matching Processes ({len(procs)})[/]  "
-                    f"[cyan]filters: {', '.join(patterns)}[/]"
-                ),
-                border_style="magenta",
-            ),
+            Panel(proc_t, title=title("Matching Processes"), border_style="magenta"),
             name="procs",
         ),
         Layout(footer, size=1, name="footer"),
@@ -665,7 +657,7 @@ def main() -> int:
             with Live(console=console, refresh_per_second=4, screen=True) as live:
                 while True:
                     snap, procs, models = tick()
-                    live.update(build_layout(snap, procs, models, patterns))
+                    live.update(build_layout(snap, procs, models))
     finally:
         if csv_file:
             csv_file.close()
