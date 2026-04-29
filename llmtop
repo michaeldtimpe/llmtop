@@ -1,0 +1,623 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["psutil>=5.9", "rich>=13.7"]
+# ///
+"""llmtop — realtime memory/swap monitor for MLX & local LLM workloads on Apple Silicon.
+
+Run:
+    ./llmtop                         # live TUI, default filters
+    ./llmtop -i 0.5                  # 0.5s refresh
+    ./llmtop -m ollama -m llama      # custom process filters
+    ./llmtop --log run.csv           # also append CSV
+    ./llmtop --jsonl run.jsonl       # also append JSONL
+    ./llmtop --no-tui --log run.csv  # headless logger
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+import psutil
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+PAGE_SIZE = 16384  # Apple Silicon
+DEFAULT_PATTERNS = [
+    "python", "mlx", "omlx", "ollama", "llama", "lm-studio", "lmstudio", "vllm"
+]
+MODEL_EXTS = (".safetensors", ".gguf", ".mlx")
+
+
+def vm_stat() -> dict[str, int]:
+    out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    stats: dict[str, int] = {}
+    for line in out.splitlines():
+        m = re.match(r'"?([^"]+?)"?:\s+(\d+)', line)
+        if m:
+            key = m.group(1).strip().lower().replace(" ", "_").replace("-", "_")
+            stats[key] = int(m.group(2))
+    return stats
+
+
+def swap_usage() -> dict[str, float]:
+    out = subprocess.run(
+        ["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True
+    ).stdout
+    m = re.search(r"total = ([\d.]+)M\s+used = ([\d.]+)M\s+free = ([\d.]+)M", out)
+    if not m:
+        return {"total_mb": 0.0, "used_mb": 0.0, "free_mb": 0.0}
+    return {
+        "total_mb": float(m.group(1)),
+        "used_mb": float(m.group(2)),
+        "free_mb": float(m.group(3)),
+    }
+
+
+def gpu_wired_limit_mb() -> int:
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "iogpu.wired_limit_mb"], capture_output=True, text=True
+        ).stdout.strip()
+        return int(out)
+    except Exception:
+        return 0
+
+
+def find_processes(patterns: list[str]) -> list[dict]:
+    pats = [p.lower() for p in patterns]
+    out: list[dict] = []
+    for p in psutil.process_iter(["pid", "name", "cmdline", "memory_info"]):
+        try:
+            name = p.info["name"] or ""
+            cmd = " ".join(p.info["cmdline"] or []).replace("\n", " ").replace("\r", " ")
+            haystack = (name + " " + cmd).lower()
+            if any(pat in haystack for pat in pats):
+                mi = p.info["memory_info"]
+                out.append(
+                    {
+                        "pid": p.info["pid"],
+                        "name": name,
+                        "cmd": cmd,
+                        "rss": mi.rss,
+                        "vms": mi.vms,
+                    }
+                )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return sorted(out, key=lambda x: -x["rss"])
+
+
+_MODEL_FLAG_RE = re.compile(
+    r"--(?:model|hf-repo|model[-_]path|adapter[-_]path)(?:[= ]+|\s+)(\S+)"
+)
+_MODEL_FILE_RE = re.compile(r"(\S+\.(?:gguf|safetensors|mlx))", re.IGNORECASE)
+
+
+def extract_model_from_cmdline(cmd: str) -> tuple[str, str | None] | None:
+    """Returns (display_name, local_path_or_None). Path is None for HF repos."""
+    if not cmd:
+        return None
+    m = _MODEL_FLAG_RE.search(cmd)
+    if m:
+        v = m.group(1).strip("\"'")
+        if v.endswith((".gguf", ".safetensors", ".mlx")):
+            return Path(v).name, v
+        return v, None
+    m = _MODEL_FILE_RE.search(cmd)
+    if m:
+        return Path(m.group(1)).name, m.group(1)
+    return None
+
+
+def _file_size(path: str | None) -> int:
+    if not path:
+        return 0
+    try:
+        p = Path(path)
+        if p.is_file():
+            return p.stat().st_size
+        if p.is_dir():
+            return sum(
+                f.stat().st_size for f in p.rglob("*")
+                if f.is_file() and f.suffix in (".gguf", ".safetensors", ".mlx", ".bin")
+            )
+    except OSError:
+        pass
+    return 0
+
+
+def ollama_models() -> list[dict]:
+    """Active ollama models from local API. Empty list if ollama isn't running."""
+    try:
+        with urllib.request.urlopen(
+            "http://127.0.0.1:11434/api/ps", timeout=0.5
+        ) as r:
+            data = json.loads(r.read())
+        return data.get("models", []) or []
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError):
+        return []
+
+
+def omlx_models() -> list[dict]:
+    """Loaded omlx models via authenticated /v1/models/status. Empty if not running."""
+    settings_path = Path.home() / ".omlx" / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    api_key = settings.get("auth", {}).get("api_key", "")
+    port = settings.get("server", {}).get("port", 8000)
+    if not api_key:
+        return []
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/models/status",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=0.5) as r:
+            data = json.loads(r.read())
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError):
+        return []
+    return [m for m in data.get("models", []) if m.get("loaded")]
+
+
+_size_cache: dict[str, int] = {}
+
+
+def model_id_from_path(path: Path) -> str:
+    """Derive a stable model id from a weight-file path.
+
+    Handles HF cache (``models--org--repo/snapshots/<hash>/<file>``),
+    omlx-style flat dirs, and single-file ggufs.
+    """
+    for ancestor in path.parents:
+        if ancestor.name.startswith("models--"):
+            return ancestor.name.removeprefix("models--").replace("--", "/")
+    parent = path.parent
+    parent_name = parent.name
+    is_hashlike = (
+        len(parent_name) >= 32
+        and all(c in "0123456789abcdef" for c in parent_name)
+    )
+    if parent_name == "snapshots" or is_hashlike:
+        return parent.parent.name
+    if path.suffix.lower() == ".gguf":
+        return path.name
+    return parent_name
+
+
+def detect_open_model_files(p: dict) -> list[dict]:
+    """Group a process's open weight files by model id."""
+    try:
+        proc = psutil.Process(p["pid"])
+        files = proc.open_files()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return []
+
+    by_model: dict[str, dict] = {}
+    for f in files:
+        path = Path(f.path)
+        if path.suffix.lower() not in MODEL_EXTS:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size < 50 * 1024 * 1024:
+            continue
+        mid = model_id_from_path(path)
+        entry = by_model.setdefault(mid, {"size": 0, "files": 0})
+        entry["size"] += size
+        entry["files"] += 1
+
+    return [
+        {
+            "source": p["name"],
+            "model": mid,
+            "size": data["size"],
+            "resident": p["rss"],
+            "proc": p["name"],
+            "pid": p["pid"],
+        }
+        for mid, data in by_model.items()
+    ]
+
+
+def collect_models(
+    procs: list[dict], ollama: list[dict], omlx: list[dict]
+) -> list[dict]:
+    """Unified list of resident models from ollama API + omlx API + per-proc
+    open files (authoritative) + cmdline (fallback). Dedupes by model id."""
+    out: list[dict] = []
+
+    for m in ollama:
+        out.append(
+            {
+                "source": "ollama",
+                "model": m.get("name") or m.get("model") or "?",
+                "size": int(m.get("size") or 0),
+                "resident": int(m.get("size_vram") or m.get("size") or 0),
+                "proc": "ollama",
+                "pid": "",
+            }
+        )
+
+    for m in omlx:
+        size = int(m.get("estimated_size") or 0)
+        out.append(
+            {
+                "source": "omlx",
+                "model": m.get("id") or "?",
+                "size": size,
+                "resident": size,
+                "proc": "omlx",
+                "pid": "",
+            }
+        )
+
+    by_model: dict[str, dict] = {}
+
+    for p in procs:
+        detected = detect_open_model_files(p)
+        if detected:
+            for entry in detected:
+                cur = by_model.get(entry["model"])
+                if cur is None or entry["resident"] > cur["resident"]:
+                    by_model[entry["model"]] = entry
+            continue
+
+        ext = extract_model_from_cmdline(p["cmd"])
+        if not ext:
+            continue
+        mid, path = ext
+        if path is not None and path not in _size_cache:
+            _size_cache[path] = _file_size(path)
+        size = _size_cache.get(path, 0) if path else 0
+        cur = by_model.get(mid)
+        if cur is None or p["rss"] > cur["resident"]:
+            by_model[mid] = {
+                "source": p["name"],
+                "model": mid,
+                "size": size,
+                "resident": p["rss"],
+                "proc": p["name"],
+                "pid": p["pid"],
+            }
+
+    out.extend(by_model.values())
+    return sorted(out, key=lambda x: -max(x["size"], x["resident"]))
+
+
+def fmt_bytes(b: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(b) < 1024:
+            return f"{b:.1f}{unit}"
+        b /= 1024
+    return f"{b:.1f}TB"
+
+
+def pages_to_bytes(pages: int) -> int:
+    return pages * PAGE_SIZE
+
+
+def collect(prev: dict, dt: float) -> dict:
+    vm = vm_stat()
+    swap = swap_usage()
+    swapins = vm.get("swapins", 0)
+    swapouts = vm.get("swapouts", 0)
+    pswapins = prev["vm"].get("swapins", swapins)
+    pswapouts = prev["vm"].get("swapouts", swapouts)
+    swapin_rate = max(0.0, (swapins - pswapins) / dt) if dt > 0 else 0.0
+    swapout_rate = max(0.0, (swapouts - pswapouts) / dt) if dt > 0 else 0.0
+    return {
+        "ts": time.time(),
+        "vm": vm,
+        "swap": swap,
+        "swapin_rate": swapin_rate,
+        "swapout_rate": swapout_rate,
+        "gpu_wired_limit_mb": gpu_wired_limit_mb(),
+    }
+
+
+def build_layout(
+    snap: dict, procs: list[dict], models: list[dict], patterns: list[str]
+) -> Layout:
+    vm = snap["vm"]
+    swap = snap["swap"]
+    total = psutil.virtual_memory().total
+
+    wired_b = pages_to_bytes(vm.get("pages_wired_down", 0))
+    active_b = pages_to_bytes(vm.get("pages_active", 0))
+    inactive_b = pages_to_bytes(vm.get("pages_inactive", 0))
+    free_b = pages_to_bytes(vm.get("pages_free", 0))
+    compressed_b = pages_to_bytes(
+        vm.get("pages_occupied_by_compressor", vm.get("pages_used_by_compressor", 0))
+    )
+    swap_color = (
+        "red bold" if swap["used_mb"] > 500
+        else "yellow" if swap["used_mb"] > 0
+        else "green"
+    )
+    rate_color = "red bold" if snap["swapout_rate"] > 0 else "green"
+    gpu_str = (
+        f"{snap['gpu_wired_limit_mb']} MB"
+        if snap["gpu_wired_limit_mb"] > 0
+        else "auto (~75%)"
+    )
+
+    sys_t = Table.grid(padding=(0, 2), expand=True)
+    for _ in range(12):
+        sys_t.add_column()
+    label = lambda s: f"[bold cyan]{s}[/]"
+    sys_t.add_row(
+        label("RAM"), fmt_bytes(total),
+        label("Wired"), fmt_bytes(wired_b),
+        label("Active"), fmt_bytes(active_b),
+        label("Inactive"), fmt_bytes(inactive_b),
+        label("Compressed"), fmt_bytes(compressed_b),
+        label("Free"), fmt_bytes(free_b),
+    )
+    sys_t.add_row(
+        label("Swap"),
+        f"[{swap_color}]{swap['used_mb']:.0f}/{swap['total_mb']:.0f}MB[/]",
+        label("Out/s"),
+        f"[{rate_color}]{snap['swapout_rate']:.1f}[/]",
+        label("In/s"), f"{snap['swapin_rate']:.1f}",
+        label("Σ out"), f"{vm.get('swapouts', 0):,}",
+        label("Σ in"), f"{vm.get('swapins', 0):,}",
+        label("iogpu wired"), gpu_str,
+    )
+
+    models_t = Table(expand=True, title_style="bold green", show_edge=False)
+    models_t.add_column("Source", style="green", no_wrap=True)
+    models_t.add_column("Model", style="bold")
+    models_t.add_column("Size", justify="right", style="cyan")
+    models_t.add_column("Resident", justify="right", style="bold yellow")
+    models_t.add_column("%", justify="right")
+    models_t.add_column("Process", style="dim", no_wrap=True)
+    models_t.add_column("PID", justify="right", style="dim")
+    if models:
+        for m in models[:10]:
+            size = m["size"]
+            res = m["resident"]
+            pct = (res / size * 100) if size > 0 else 0
+            pct_color = (
+                "green" if pct >= 90 else "yellow" if pct >= 50 else "red"
+            ) if size > 0 else "dim"
+            pct_s = f"[{pct_color}]{pct:5.1f}%[/]" if size > 0 else "[dim]—[/]"
+            models_t.add_row(
+                m["source"],
+                m["model"],
+                fmt_bytes(size) if size > 0 else "[dim]—[/]",
+                fmt_bytes(res),
+                pct_s,
+                m["proc"],
+                str(m["pid"]) if m["pid"] != "" else "—",
+            )
+    else:
+        models_t.add_row(
+            "—", "[dim](no models detected — check ollama API or proc filters)[/]",
+            "", "", "", "", "",
+        )
+
+    proc_t = Table(expand=True, show_edge=False)
+    proc_t.add_column("PID", justify="right", style="dim", no_wrap=True, width=7)
+    proc_t.add_column(
+        "Name", style="cyan", no_wrap=True, min_width=28, overflow="ellipsis"
+    )
+    proc_t.add_column("RSS", justify="right", style="bold", width=9)
+    proc_t.add_column("VMS", justify="right", style="dim", width=9)
+    proc_t.add_column("Cmd", overflow="ellipsis", no_wrap=True, ratio=2)
+    for p in procs[:20]:
+        proc_t.add_row(
+            str(p["pid"]),
+            p["name"],
+            fmt_bytes(p["rss"]),
+            fmt_bytes(p["vms"]),
+            p["cmd"],
+        )
+    if not procs:
+        proc_t.add_row("—", "(none)", "", "", "")
+
+    header = Text(
+        f"llmtop  {datetime.now():%Y-%m-%d %H:%M:%S}   "
+        f"filters: {', '.join(patterns)}   ctrl-c to quit",
+        style="bold white on blue",
+    )
+    models_size = max(4, min(12, len(models) + 4))
+
+    layout = Layout()
+    layout.split_column(
+        Layout(header, size=1, name="header"),
+        Layout(
+            Panel(sys_t, title="System Memory", border_style="cyan"),
+            size=6, name="system",
+        ),
+        Layout(
+            Panel(models_t, title="Active Models", border_style="green"),
+            size=models_size, name="models",
+        ),
+        Layout(
+            Panel(
+                proc_t, title=f"Matching Processes ({len(procs)})",
+                border_style="magenta",
+            ),
+            name="procs",
+        ),
+    )
+    return layout
+
+
+def log_row(
+    snap: dict, procs: list[dict], models: list[dict], csv_w, jsonl_f
+) -> None:
+    vm = snap["vm"]
+    swap = snap["swap"]
+    compressed_b = pages_to_bytes(
+        vm.get("pages_occupied_by_compressor", vm.get("pages_used_by_compressor", 0))
+    )
+    top = procs[0] if procs else {"pid": "", "name": "", "rss": 0}
+    ts = datetime.fromtimestamp(snap["ts"]).isoformat(timespec="seconds")
+
+    if csv_w:
+        csv_w.writerow(
+            [
+                ts,
+                f"{pages_to_bytes(vm.get('pages_wired_down', 0)) / 1e6:.1f}",
+                f"{pages_to_bytes(vm.get('pages_active', 0)) / 1e6:.1f}",
+                f"{compressed_b / 1e6:.1f}",
+                f"{pages_to_bytes(vm.get('pages_free', 0)) / 1e6:.1f}",
+                f"{swap['used_mb']:.1f}",
+                f"{swap['total_mb']:.1f}",
+                vm.get("swapins", 0),
+                vm.get("swapouts", 0),
+                f"{snap['swapin_rate']:.2f}",
+                f"{snap['swapout_rate']:.2f}",
+                top["pid"],
+                top["name"],
+                f"{top['rss'] / 1e6:.1f}",
+            ]
+        )
+    if jsonl_f:
+        jsonl_f.write(
+            json.dumps(
+                {
+                    "ts": ts,
+                    "wired_mb": pages_to_bytes(vm.get("pages_wired_down", 0)) / 1e6,
+                    "active_mb": pages_to_bytes(vm.get("pages_active", 0)) / 1e6,
+                    "compressed_mb": compressed_b / 1e6,
+                    "free_mb": pages_to_bytes(vm.get("pages_free", 0)) / 1e6,
+                    "swap_used_mb": swap["used_mb"],
+                    "swapouts_total": vm.get("swapouts", 0),
+                    "swapins_total": vm.get("swapins", 0),
+                    "swapin_rate": round(snap["swapin_rate"], 2),
+                    "swapout_rate": round(snap["swapout_rate"], 2),
+                    "gpu_wired_limit_mb": snap["gpu_wired_limit_mb"],
+                    "procs": [
+                        {
+                            "pid": p["pid"],
+                            "name": p["name"],
+                            "rss_mb": round(p["rss"] / 1e6, 1),
+                        }
+                        for p in procs[:8]
+                    ],
+                    "models": [
+                        {
+                            "source": m["source"],
+                            "model": m["model"],
+                            "size_mb": round(m["size"] / 1e6, 1),
+                            "resident_mb": round(m["resident"] / 1e6, 1),
+                            "pid": m["pid"],
+                        }
+                        for m in models
+                    ],
+                }
+            )
+            + "\n"
+        )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("-i", "--interval", type=float, default=1.0, help="seconds (default 1)")
+    ap.add_argument(
+        "-m", "--match", action="append", default=[],
+        help=f"process name/cmd substring (repeatable; default: {','.join(DEFAULT_PATTERNS)})",
+    )
+    ap.add_argument("--log", type=Path, help="append CSV log to file")
+    ap.add_argument("--jsonl", type=Path, help="append JSONL log to file")
+    ap.add_argument("--no-tui", action="store_true", help="headless mode: only log, no UI")
+    args = ap.parse_args()
+
+    patterns = args.match or DEFAULT_PATTERNS
+    console = Console()
+
+    csv_file = csv_w = None
+    if args.log:
+        new = not args.log.exists()
+        csv_file = args.log.open("a", newline="")
+        csv_w = csv.writer(csv_file)
+        if new:
+            csv_w.writerow(
+                [
+                    "ts", "wired_mb", "active_mb", "compressed_mb", "free_mb",
+                    "swap_used_mb", "swap_total_mb", "swapins_total", "swapouts_total",
+                    "swapin_rate", "swapout_rate", "top_pid", "top_name", "top_rss_mb",
+                ]
+            )
+    jsonl_file = args.jsonl.open("a") if args.jsonl else None
+
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    prev = {"ts": time.time(), "vm": vm_stat()}
+
+    def tick() -> tuple[dict, list[dict], list[dict]]:
+        nonlocal prev
+        time.sleep(args.interval)
+        now_ts = time.time()
+        dt = now_ts - prev["ts"]
+        snap = collect(prev, dt)
+        procs = find_processes(patterns)
+        models = collect_models(procs, ollama_models(), omlx_models())
+        log_row(snap, procs, models, csv_w, jsonl_file)
+        if csv_file:
+            csv_file.flush()
+        if jsonl_file:
+            jsonl_file.flush()
+        prev = {"ts": snap["ts"], "vm": snap["vm"]}
+        return snap, procs, models
+
+    try:
+        if args.no_tui:
+            console.print(
+                f"[dim]logging every {args.interval}s — ctrl-c to stop[/dim]"
+            )
+            while True:
+                snap, procs, models = tick()
+                top = procs[0] if procs else {"name": "-", "rss": 0}
+                model_str = (
+                    " ".join(
+                        f"{m['model']}({fmt_bytes(m['resident'])}/{fmt_bytes(m['size'])})"
+                        if m["size"] else f"{m['model']}({fmt_bytes(m['resident'])})"
+                        for m in models[:3]
+                    )
+                    or "-"
+                )
+                console.print(
+                    f"{datetime.now():%H:%M:%S} "
+                    f"swap={snap['swap']['used_mb']:7.1f}MB "
+                    f"out/s={snap['swapout_rate']:5.1f} "
+                    f"in/s={snap['swapin_rate']:5.1f} "
+                    f"top={top['name']}({fmt_bytes(top['rss'])}) "
+                    f"models={model_str}"
+                )
+        else:
+            with Live(console=console, refresh_per_second=4, screen=True) as live:
+                while True:
+                    snap, procs, models = tick()
+                    live.update(build_layout(snap, procs, models, patterns))
+    finally:
+        if csv_file:
+            csv_file.close()
+        if jsonl_file:
+            jsonl_file.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
