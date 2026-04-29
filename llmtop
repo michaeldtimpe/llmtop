@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Deque
 
 import psutil
+from rich import box
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
@@ -594,7 +595,10 @@ def build_layout(
             label("Window"), f"{len(out_vals)} pts",
         )
 
-    models_t = Table(expand=True, title_style="bold green", show_edge=False)
+    models_t = Table(
+        expand=True, title_style="bold green",
+        show_edge=False, box=box.SIMPLE_HEAD,
+    )
     models_t.add_column("Source", style="green", no_wrap=True)
     models_t.add_column("Model", style="bold")
     models_t.add_column("Size", justify="right", style="cyan")
@@ -646,7 +650,7 @@ def build_layout(
             "", "", "", "", "",
         )
 
-    proc_t = Table(expand=True, show_edge=False)
+    proc_t = Table(expand=True, show_edge=False, box=box.SIMPLE_HEAD)
     proc_t.add_column("PID", justify="right", style="dim", no_wrap=True, width=7)
     proc_t.add_column(
         "Name", style="cyan", no_wrap=True, min_width=28, overflow="ellipsis"
