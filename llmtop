@@ -6,18 +6,23 @@
 """llmtop — realtime memory/swap monitor for MLX & local LLM workloads on Apple Silicon.
 
 Run:
-    ./llmtop                         # live TUI, default filters
-    ./llmtop -i 0.5                  # 0.5s refresh
-    ./llmtop -m ollama -m llama      # custom process filters
-    ./llmtop --log run.csv           # also append CSV
-    ./llmtop --jsonl run.jsonl       # also append JSONL
-    ./llmtop --no-tui --log run.csv  # headless logger
+    ./llmtop                          # live TUI, default filters
+    ./llmtop -i 0.5                   # 0.5s refresh
+    ./llmtop -m ollama -m llama       # custom process filters
+    ./llmtop --log run.csv            # also append CSV
+    ./llmtop --jsonl run.jsonl        # also append JSONL
+    ./llmtop --no-tui --log run.csv   # headless logger
+    ./llmtop --once                   # one sample as JSON to stdout, then exit
+    ./llmtop --alert-swap-mb 1000     # macOS notification at 1GB swap used
+    ./llmtop --alert-swap-rate 100    # notify on sustained swapout pages/s
+    ./llmtop --alert-pressure         # notify on Warning/Critical transitions
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import os
 import re
 import signal
 import subprocess
@@ -25,11 +30,14 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import deque
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
+from typing import Deque
 
 import psutil
-from rich.console import Console
+from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -38,9 +46,13 @@ from rich.text import Text
 
 PAGE_SIZE = 16384  # Apple Silicon
 DEFAULT_PATTERNS = [
-    "python", "mlx", "omlx", "ollama", "llama", "lm-studio", "lmstudio", "vllm"
+    "python", "mlx", "omlx", "ollama", "llama",
+    "lm-studio", "lmstudio", "vllm",
+    "text-generation-inference", "tgi", "candle",
 ]
 MODEL_EXTS = (".safetensors", ".gguf", ".mlx")
+HIST_LEN = 40
+SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 
 
 def vm_stat() -> dict[str, int]:
@@ -97,28 +109,127 @@ PRESSURE_LABELS: dict[int, tuple[str, str]] = {
 }
 
 
-def find_processes(patterns: list[str]) -> list[dict]:
-    pats = [p.lower() for p in patterns]
-    out: list[dict] = []
-    for p in psutil.process_iter(["pid", "name", "cmdline", "memory_info"]):
+class Alerter:
+    """Threshold-based alerting with per-condition debounce."""
+
+    DEBOUNCE_S = 60.0
+    SUSTAINED_TICKS = 5
+
+    def __init__(
+        self,
+        swap_mb: float | None,
+        swap_rate: float | None,
+        on_pressure: bool,
+    ) -> None:
+        self.swap_mb = swap_mb
+        self.swap_rate = swap_rate
+        self.on_pressure = on_pressure
+        self.rate_streak = 0
+        self.last_pressure = 1
+        self.last_fired: dict[str, float] = {}
+
+    def _fire(self, key: str, msg: str) -> None:
+        now = time.time()
+        if now - self.last_fired.get(key, 0.0) < self.DEBOUNCE_S:
+            return
+        self.last_fired[key] = now
+        sys.stderr.write(f"[llmtop alert] {msg}\n")
+        sys.stderr.flush()
+        safe = msg.replace('"', "'").replace("\n", " ")
         try:
-            name = p.info["name"] or ""
-            cmd = " ".join(p.info["cmdline"] or []).replace("\n", " ").replace("\r", " ")
-            haystack = (name + " " + cmd).lower()
-            if any(pat in haystack for pat in pats):
-                mi = p.info["memory_info"]
-                out.append(
-                    {
-                        "pid": p.info["pid"],
-                        "name": name,
-                        "cmd": cmd,
-                        "rss": mi.rss,
-                        "vms": mi.vms,
-                    }
+            subprocess.run(
+                [
+                    "osascript", "-e",
+                    f'display notification "{safe}" with title "llmtop"',
+                ],
+                check=False, capture_output=True, timeout=2,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            pass
+
+    def check(self, snap: dict) -> None:
+        if self.swap_mb is not None:
+            used = snap["swap"]["used_mb"]
+            if used > self.swap_mb:
+                self._fire(
+                    "swap_mb",
+                    f"swap used {used:.0f} MB > {self.swap_mb:.0f} MB",
                 )
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
-    return sorted(out, key=lambda x: -x["rss"])
+        if self.swap_rate is not None:
+            rate = snap["swapout_rate"]
+            if rate > self.swap_rate:
+                self.rate_streak += 1
+                if self.rate_streak >= self.SUSTAINED_TICKS:
+                    self._fire(
+                        "swap_rate",
+                        f"swapout sustained {rate:.0f} pages/s > "
+                        f"{self.swap_rate:.0f} for {self.rate_streak} ticks",
+                    )
+            else:
+                self.rate_streak = 0
+        if self.on_pressure:
+            cur = snap["pressure"]
+            if cur in (2, 4) and cur != self.last_pressure:
+                lbl = PRESSURE_LABELS.get(cur, ("?", ""))[0]
+                self._fire("pressure", f"memory pressure → {lbl}")
+            self.last_pressure = cur
+
+
+_PROC_GONE = (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess)
+
+
+class ProcScanner:
+    """Filter-matching process list with a fast/slow path.
+
+    Full ``process_iter`` rescan every ``full_scan_interval`` seconds; between
+    rescans only ``memory_info`` is re-polled for cached PIDs. Names and
+    cmdlines rarely change, so this avoids walking the full process table on
+    every tick.
+    """
+
+    def __init__(self, patterns: list[str], full_scan_interval: float = 5.0) -> None:
+        self.pats = [p.lower() for p in patterns]
+        self.full_scan_interval = full_scan_interval
+        self.last_full = 0.0
+        self.cache: dict[int, dict] = {}
+
+    def scan(self) -> list[dict]:
+        now = time.time()
+        if now - self.last_full >= self.full_scan_interval:
+            self._full_rescan()
+            self.last_full = now
+        else:
+            self._refresh_mem()
+        return sorted(self.cache.values(), key=lambda x: -x["rss"])
+
+    def _full_rescan(self) -> None:
+        new_cache: dict[int, dict] = {}
+        for p in psutil.process_iter(["pid", "name", "cmdline", "memory_info"]):
+            try:
+                name = p.info["name"] or ""
+                cmd = " ".join(p.info["cmdline"] or []).replace("\n", " ").replace("\r", " ")
+                if not any(pat in (name + " " + cmd).lower() for pat in self.pats):
+                    continue
+                mi = p.info["memory_info"]
+                new_cache[p.info["pid"]] = {
+                    "pid": p.info["pid"],
+                    "name": name,
+                    "cmd": cmd,
+                    "rss": mi.rss,
+                    "vms": mi.vms,
+                }
+            except _PROC_GONE:
+                continue
+        self.cache = new_cache
+
+    def _refresh_mem(self) -> None:
+        for pid in list(self.cache):
+            try:
+                mi = psutil.Process(pid).memory_info()
+                self.cache[pid]["rss"] = mi.rss
+                self.cache[pid]["vms"] = mi.vms
+            except _PROC_GONE:
+                self.cache.pop(pid, None)
 
 
 _MODEL_FLAG_RE = re.compile(
@@ -195,6 +306,25 @@ def omlx_models() -> list[dict]:
     return [m for m in data.get("models", []) if m.get("loaded")]
 
 
+def lmstudio_models() -> list[dict]:
+    """Loaded LM Studio models via /api/v0/models. Empty if not running.
+
+    Uses the LM Studio 0.3.x REST endpoint which exposes a ``state`` field; we
+    only return entries with ``state == "loaded"``. Port can be overridden via
+    the ``LMSTUDIO_PORT`` env var (default 1234).
+    """
+    port = os.environ.get("LMSTUDIO_PORT", "1234")
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/v0/models", timeout=0.5
+        ) as r:
+            data = json.loads(r.read())
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, ValueError):
+        return []
+    items = data.get("data") or data.get("models") or []
+    return [m for m in items if m.get("state") == "loaded"]
+
+
 _size_cache: dict[str, int] = {}
 
 
@@ -265,10 +395,13 @@ def detect_open_model_files(p: dict) -> list[dict]:
 
 
 def collect_models(
-    procs: list[dict], ollama: list[dict], omlx: list[dict]
+    procs: list[dict],
+    ollama: list[dict],
+    omlx: list[dict],
+    lmstudio: list[dict],
 ) -> list[dict]:
-    """Unified list of resident models from ollama API + omlx API + per-proc
-    open files (authoritative) + cmdline (fallback). Dedupes by model id."""
+    """Unified list of resident models from ollama API + omlx API + LM Studio
+    API + per-proc open files (authoritative) + cmdline (fallback)."""
     out: list[dict] = []
 
     for m in ollama:
@@ -292,6 +425,19 @@ def collect_models(
                 "size": size,
                 "resident": size,
                 "proc": "omlx",
+                "pid": "",
+            }
+        )
+
+    for m in lmstudio:
+        size = int(m.get("size") or m.get("file_size") or 0)
+        out.append(
+            {
+                "source": "lmstudio",
+                "model": m.get("id") or "?",
+                "size": size,
+                "resident": size,
+                "proc": "lmstudio",
                 "pid": "",
             }
         )
@@ -341,6 +487,19 @@ def pages_to_bytes(pages: int) -> int:
     return pages * PAGE_SIZE
 
 
+def sparkline(vals: Iterable[float], width: int = HIST_LEN) -> str:
+    """Render an iterable of non-negative values as Unicode block glyphs,
+    autoscaled to the series max. Returns ``" " * width`` for an empty series."""
+    vs = list(vals)[-width:]
+    if not vs:
+        return " " * width
+    mx = max(vs)
+    if mx <= 0:
+        return SPARK_BLOCKS[0] * len(vs)
+    last = len(SPARK_BLOCKS) - 1
+    return "".join(SPARK_BLOCKS[min(last, int(v / mx * last))] for v in vs)
+
+
 def collect(prev: dict, dt: float) -> dict:
     vm = vm_stat()
     swap = swap_usage()
@@ -364,7 +523,12 @@ def collect(prev: dict, dt: float) -> dict:
     }
 
 
-def build_layout(snap: dict, procs: list[dict], models: list[dict]) -> Layout:
+def build_layout(
+    snap: dict,
+    procs: list[dict],
+    models: list[dict],
+    history: dict[str, Deque[float]] | None = None,
+) -> Layout:
     vm = snap["vm"]
     swap = snap["swap"]
     total = psutil.virtual_memory().total
@@ -432,6 +596,34 @@ def build_layout(snap: dict, procs: list[dict], models: list[dict]) -> Layout:
         "", "",
     )
 
+    if history:
+        out_vals = list(history.get("swapout", ()))
+        cmp_vals = list(history.get("compress", ()))
+        out_cur = out_vals[-1] if out_vals else 0.0
+        out_peak = max(out_vals) if out_vals else 0.0
+        cmp_cur = cmp_vals[-1] if cmp_vals else 0.0
+        cmp_peak = max(cmp_vals) if cmp_vals else 0.0
+        out_color = "red" if out_peak > 0 else "dim"
+        cmp_color = "yellow" if cmp_peak > 0 else "dim"
+
+        trend_t = Table.grid(padding=(0, 2), expand=False)
+        trend_t.add_column(justify="right", no_wrap=True)
+        trend_t.add_column(no_wrap=True)
+        trend_t.add_column(no_wrap=True, style="dim")
+        trend_t.add_row(
+            label("Swap out"),
+            f"[{out_color}]{sparkline(out_vals)}[/]",
+            f"{out_cur:>5.0f} pg/s · peak {out_peak:.0f} ({len(out_vals)} pts)",
+        )
+        trend_t.add_row(
+            label("Compress"),
+            f"[{cmp_color}]{sparkline(cmp_vals)}[/]",
+            f"{cmp_cur:>5.1f} MB/s · peak {cmp_peak:.1f}",
+        )
+        pressure_body: Group | Table = Group(pressure_t, trend_t)
+    else:
+        pressure_body = pressure_t
+
     models_t = Table(expand=True, title_style="bold green", show_edge=False)
     models_t.add_column("Source", style="green", no_wrap=True)
     models_t.add_column("Model", style="bold")
@@ -441,7 +633,8 @@ def build_layout(snap: dict, procs: list[dict], models: list[dict]) -> Layout:
     models_t.add_column("Process", style="dim", no_wrap=True)
     models_t.add_column("PID", justify="right", style="dim")
     if models:
-        for m in models[:10]:
+        shown = models[:10]
+        for m in shown:
             size = m["size"]
             res = m["resident"]
             pct = (res / size * 100) if size > 0 else 0
@@ -457,6 +650,25 @@ def build_layout(snap: dict, procs: list[dict], models: list[dict]) -> Layout:
                 pct_s,
                 m["proc"],
                 str(m["pid"]) if m["pid"] != "" else "—",
+            )
+        if len(shown) >= 2:
+            tot_size = sum(m["size"] for m in shown)
+            tot_res = sum(m["resident"] for m in shown)
+            ram_pct = (tot_res / total * 100) if total > 0 else 0
+            ram_color = (
+                "red bold" if ram_pct >= 70
+                else "yellow" if ram_pct >= 40
+                else "green"
+            )
+            models_t.add_section()
+            models_t.add_row(
+                "[bold]TOTAL[/]",
+                "",
+                fmt_bytes(tot_size) if tot_size > 0 else "[dim]—[/]",
+                f"[bold]{fmt_bytes(tot_res)}[/]",
+                f"[{ram_color}]{ram_pct:5.1f}% RAM[/]",
+                "",
+                "",
             )
     else:
         models_t.add_row(
@@ -494,8 +706,8 @@ def build_layout(snap: dict, procs: list[dict], models: list[dict]) -> Layout:
             size=6, name="system",
         ),
         Layout(
-            Panel(pressure_t, title=title("Memory Pressure"), border_style="yellow"),
-            size=5, name="pressure",
+            Panel(pressure_body, title=title("Memory Pressure"), border_style="yellow"),
+            size=7, name="pressure",
         ),
         Layout(
             Panel(models_t, title=title("Active Models"), border_style="green"),
@@ -508,6 +720,47 @@ def build_layout(snap: dict, procs: list[dict], models: list[dict]) -> Layout:
         Layout(footer, size=1, name="footer"),
     )
     return layout
+
+
+def jsonl_payload(snap: dict, procs: list[dict], models: list[dict]) -> dict:
+    vm = snap["vm"]
+    swap = snap["swap"]
+    compressed_b = pages_to_bytes(
+        vm.get("pages_occupied_by_compressor", vm.get("pages_used_by_compressor", 0))
+    )
+    ts = datetime.fromtimestamp(snap["ts"]).isoformat(timespec="seconds")
+    return {
+        "ts": ts,
+        "wired_mb": pages_to_bytes(vm.get("pages_wired_down", 0)) / 1e6,
+        "active_mb": pages_to_bytes(vm.get("pages_active", 0)) / 1e6,
+        "compressed_mb": compressed_b / 1e6,
+        "free_mb": pages_to_bytes(vm.get("pages_free", 0)) / 1e6,
+        "swap_used_mb": swap["used_mb"],
+        "swapouts_total": vm.get("swapouts", 0),
+        "swapins_total": vm.get("swapins", 0),
+        "swapin_rate": round(snap["swapin_rate"], 2),
+        "swapout_rate": round(snap["swapout_rate"], 2),
+        "pressure": snap["pressure"],
+        "gpu_wired_limit_mb": snap["gpu_wired_limit_mb"],
+        "procs": [
+            {
+                "pid": p["pid"],
+                "name": p["name"],
+                "rss_mb": round(p["rss"] / 1e6, 1),
+            }
+            for p in procs[:8]
+        ],
+        "models": [
+            {
+                "source": m["source"],
+                "model": m["model"],
+                "size_mb": round(m["size"] / 1e6, 1),
+                "resident_mb": round(m["resident"] / 1e6, 1),
+                "pid": m["pid"],
+            }
+            for m in models
+        ],
+    }
 
 
 def log_row(
@@ -541,42 +794,7 @@ def log_row(
             ]
         )
     if jsonl_f:
-        jsonl_f.write(
-            json.dumps(
-                {
-                    "ts": ts,
-                    "wired_mb": pages_to_bytes(vm.get("pages_wired_down", 0)) / 1e6,
-                    "active_mb": pages_to_bytes(vm.get("pages_active", 0)) / 1e6,
-                    "compressed_mb": compressed_b / 1e6,
-                    "free_mb": pages_to_bytes(vm.get("pages_free", 0)) / 1e6,
-                    "swap_used_mb": swap["used_mb"],
-                    "swapouts_total": vm.get("swapouts", 0),
-                    "swapins_total": vm.get("swapins", 0),
-                    "swapin_rate": round(snap["swapin_rate"], 2),
-                    "swapout_rate": round(snap["swapout_rate"], 2),
-                    "gpu_wired_limit_mb": snap["gpu_wired_limit_mb"],
-                    "procs": [
-                        {
-                            "pid": p["pid"],
-                            "name": p["name"],
-                            "rss_mb": round(p["rss"] / 1e6, 1),
-                        }
-                        for p in procs[:8]
-                    ],
-                    "models": [
-                        {
-                            "source": m["source"],
-                            "model": m["model"],
-                            "size_mb": round(m["size"] / 1e6, 1),
-                            "resident_mb": round(m["resident"] / 1e6, 1),
-                            "pid": m["pid"],
-                        }
-                        for m in models
-                    ],
-                }
-            )
-            + "\n"
-        )
+        jsonl_f.write(json.dumps(jsonl_payload(snap, procs, models)) + "\n")
 
 
 def main() -> int:
@@ -589,6 +807,16 @@ def main() -> int:
     ap.add_argument("--log", type=Path, help="append CSV log to file")
     ap.add_argument("--jsonl", type=Path, help="append JSONL log to file")
     ap.add_argument("--no-tui", action="store_true", help="headless mode: only log, no UI")
+    ap.add_argument("--once", action="store_true",
+                    help="take one sample, print JSON to stdout, exit")
+    ap.add_argument("--proc-scan-interval", type=float, default=5.0,
+                    help="seconds between full process_iter rescans (default 5)")
+    ap.add_argument("--alert-swap-mb", type=float, default=None, metavar="N",
+                    help="notify when swap used exceeds N MB")
+    ap.add_argument("--alert-swap-rate", type=float, default=None, metavar="N",
+                    help="notify when swapout rate (pages/s) stays above N for ~5 ticks")
+    ap.add_argument("--alert-pressure", action="store_true",
+                    help="notify on transition into Warning/Critical pressure")
     args = ap.parse_args()
 
     patterns = args.match or DEFAULT_PATTERNS
@@ -611,6 +839,18 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 
+    scanner = ProcScanner(patterns, full_scan_interval=args.proc_scan_interval)
+    alerter = Alerter(
+        swap_mb=args.alert_swap_mb,
+        swap_rate=args.alert_swap_rate,
+        on_pressure=args.alert_pressure,
+    )
+    history: dict[str, Deque[float]] = {
+        "swapout": deque(maxlen=HIST_LEN),
+        "compress": deque(maxlen=HIST_LEN),
+        "pageout": deque(maxlen=HIST_LEN),
+    }
+
     prev = {"ts": time.time(), "vm": vm_stat()}
 
     def tick() -> tuple[dict, list[dict], list[dict]]:
@@ -619,17 +859,28 @@ def main() -> int:
         now_ts = time.time()
         dt = now_ts - prev["ts"]
         snap = collect(prev, dt)
-        procs = find_processes(patterns)
-        models = collect_models(procs, ollama_models(), omlx_models())
+        procs = scanner.scan()
+        models = collect_models(
+            procs, ollama_models(), omlx_models(), lmstudio_models()
+        )
         log_row(snap, procs, models, csv_w, jsonl_file)
         if csv_file:
             csv_file.flush()
         if jsonl_file:
             jsonl_file.flush()
+        history["swapout"].append(snap["swapout_rate"])
+        history["compress"].append(snap["compress_rate"] * PAGE_SIZE / (1024 * 1024))
+        history["pageout"].append(snap["pageout_rate"])
+        alerter.check(snap)
         prev = {"ts": snap["ts"], "vm": snap["vm"]}
         return snap, procs, models
 
     try:
+        if args.once:
+            snap, procs, models = tick()
+            sys.stdout.write(json.dumps(jsonl_payload(snap, procs, models)) + "\n")
+            sys.stdout.flush()
+            return 0
         if args.no_tui:
             console.print(
                 f"[dim]logging every {args.interval}s — ctrl-c to stop[/dim]"
@@ -657,7 +908,7 @@ def main() -> int:
             with Live(console=console, refresh_per_second=4, screen=True) as live:
                 while True:
                     snap, procs, models = tick()
-                    live.update(build_layout(snap, procs, models))
+                    live.update(build_layout(snap, procs, models, history))
     finally:
         if csv_file:
             csv_file.close()
