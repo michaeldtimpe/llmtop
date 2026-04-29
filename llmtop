@@ -653,7 +653,7 @@ def build_layout(
     proc_t = Table(expand=True, show_edge=False, box=box.SIMPLE_HEAD)
     proc_t.add_column("PID", justify="right", style="dim", no_wrap=True, width=7)
     proc_t.add_column(
-        "Name", style="cyan", no_wrap=True, min_width=28, overflow="ellipsis"
+        "Name", style="cyan", no_wrap=True, min_width=14, overflow="ellipsis"
     )
     proc_t.add_column("RSS", justify="right", style="bold", width=9)
     proc_t.add_column("VMS", justify="right", style="dim", width=9)
@@ -679,12 +679,12 @@ def build_layout(
         Layout(
             Panel(sys_t, title=title("System Memory"),
                   border_style="cyan", padding=pad),
-            size=7, name="system",
+            size=5, name="system",
         ),
         Layout(
             Panel(pressure_t, title=title("Memory Pressure"),
                   border_style="yellow", padding=pad),
-            size=7, name="pressure",
+            size=6, name="pressure",
         ),
         Layout(
             Panel(models_t, title=title("Active Models"),
