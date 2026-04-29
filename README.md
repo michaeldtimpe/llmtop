@@ -8,6 +8,7 @@ A realtime memory, swap, and model-residency monitor for **MLX** and other local
 
 - **System memory** — wired / active / inactive / compressed / free, plus total RAM.
 - **Swap activity** — used vs. total, instantaneous in/out rate, and cumulative counters. Swap-out rate is highlighted red because for an LLM workload it usually means you're about to evict weights.
+- **Memory pressure** — kernel pressure level (`Normal` / `Warning` / `Critical` from `kern.memorystatus_vm_pressure_level`), compressor and decompressor throughput in MB/s, file-backed pageout rate (red when non-zero — catches mmap'd weight eviction *before* swap moves), and purgeable headroom.
 - **`iogpu.wired_limit_mb`** — the GPU wired-memory cap (`auto` or whatever you've sysctl'd).
 - **Active models** — unified view of resident models, with size on disk vs. resident memory and a residency `%`. Pulled from:
   - the **ollama** local API (`/api/ps` on `127.0.0.1:11434`),

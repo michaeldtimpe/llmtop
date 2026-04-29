@@ -78,6 +78,25 @@ def gpu_wired_limit_mb() -> int:
         return 0
 
 
+def pressure_level() -> int:
+    """1=normal, 2=warning, 4=critical, 0=unknown."""
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        return int(out)
+    except (ValueError, FileNotFoundError):
+        return 0
+
+
+PRESSURE_LABELS: dict[int, tuple[str, str]] = {
+    1: ("Normal", "green"),
+    2: ("Warning", "yellow bold"),
+    4: ("Critical", "red bold"),
+}
+
+
 def find_processes(patterns: list[str]) -> list[dict]:
     pats = [p.lower() for p in patterns]
     out: list[dict] = []
@@ -318,18 +337,22 @@ def pages_to_bytes(pages: int) -> int:
 def collect(prev: dict, dt: float) -> dict:
     vm = vm_stat()
     swap = swap_usage()
-    swapins = vm.get("swapins", 0)
-    swapouts = vm.get("swapouts", 0)
-    pswapins = prev["vm"].get("swapins", swapins)
-    pswapouts = prev["vm"].get("swapouts", swapouts)
-    swapin_rate = max(0.0, (swapins - pswapins) / dt) if dt > 0 else 0.0
-    swapout_rate = max(0.0, (swapouts - pswapouts) / dt) if dt > 0 else 0.0
+
+    def rate(key: str) -> float:
+        cur = vm.get(key, 0)
+        prv = prev["vm"].get(key, cur)
+        return max(0.0, (cur - prv) / dt) if dt > 0 else 0.0
+
     return {
         "ts": time.time(),
         "vm": vm,
         "swap": swap,
-        "swapin_rate": swapin_rate,
-        "swapout_rate": swapout_rate,
+        "swapin_rate": rate("swapins"),
+        "swapout_rate": rate("swapouts"),
+        "compress_rate": rate("pages_compressed"),
+        "decompress_rate": rate("pages_decompressed"),
+        "pageout_rate": rate("pageouts"),
+        "pressure": pressure_level(),
         "gpu_wired_limit_mb": gpu_wired_limit_mb(),
     }
 
@@ -383,6 +406,27 @@ def build_layout(
         label("iogpu wired"), gpu_str,
     )
 
+    plabel, pcolor = PRESSURE_LABELS.get(snap["pressure"], ("?", "dim"))
+    purgeable_b = pages_to_bytes(vm.get("pages_purgeable", 0))
+    pageout_mbps = snap["pageout_rate"] * PAGE_SIZE / (1024 * 1024)
+    compress_mbps = snap["compress_rate"] * PAGE_SIZE / (1024 * 1024)
+    decompress_mbps = snap["decompress_rate"] * PAGE_SIZE / (1024 * 1024)
+    pageout_color = "red bold" if pageout_mbps > 0 else "green"
+
+    pressure_t = Table.grid(padding=(0, 2), expand=True)
+    for _ in range(6):
+        pressure_t.add_column()
+    pressure_t.add_row(
+        label("Pressure"), f"[{pcolor}]{plabel}[/]",
+        label("Compress"), f"{compress_mbps:.1f} MB/s",
+        label("Decompress"), f"{decompress_mbps:.1f} MB/s",
+    )
+    pressure_t.add_row(
+        label("Purgeable"), fmt_bytes(purgeable_b),
+        label("Pageout"), f"[{pageout_color}]{pageout_mbps:.1f} MB/s[/]",
+        "", "",
+    )
+
     models_t = Table(expand=True, title_style="bold green", show_edge=False)
     models_t.add_column("Source", style="green", no_wrap=True)
     models_t.add_column("Model", style="bold")
@@ -434,19 +478,18 @@ def build_layout(
     if not procs:
         proc_t.add_row("—", "(none)", "", "", "")
 
-    header = Text(
-        f"llmtop  {datetime.now():%Y-%m-%d %H:%M:%S}   "
-        f"filters: {', '.join(patterns)}   ctrl-c to quit",
-        style="bold white on blue",
-    )
+    footer = Text("ctrl-c to quit", justify="right", style="dim")
     models_size = max(4, min(12, len(models) + 4))
 
     layout = Layout()
     layout.split_column(
-        Layout(header, size=1, name="header"),
         Layout(
             Panel(sys_t, title="System Memory", border_style="cyan"),
             size=6, name="system",
+        ),
+        Layout(
+            Panel(pressure_t, title="Memory Pressure", border_style="yellow"),
+            size=5, name="pressure",
         ),
         Layout(
             Panel(models_t, title="Active Models", border_style="green"),
@@ -454,11 +497,16 @@ def build_layout(
         ),
         Layout(
             Panel(
-                proc_t, title=f"Matching Processes ({len(procs)})",
+                proc_t,
+                title=(
+                    f"[bold cyan]Matching Processes ({len(procs)})[/]  "
+                    f"[cyan]filters: {', '.join(patterns)}[/]"
+                ),
                 border_style="magenta",
             ),
             name="procs",
         ),
+        Layout(footer, size=1, name="footer"),
     )
     return layout
 
