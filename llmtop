@@ -568,20 +568,6 @@ def build_layout(
     decompress_mbps = snap["decompress_rate"] * PAGE_SIZE / (1024 * 1024)
     pageout_color = "red bold" if pageout_mbps > 0 else "green"
 
-    pressure_t = Table.grid(padding=(0, 2), expand=True)
-    for _ in range(6):
-        pressure_t.add_column()
-    pressure_t.add_row(
-        label("Pressure"), f"[{pcolor}]{plabel}[/]",
-        label("Compress"), f"{compress_mbps:.1f} MB/s",
-        label("Decompress"), f"{decompress_mbps:.1f} MB/s",
-    )
-    pressure_t.add_row(
-        label("Purgeable"), fmt_bytes(purgeable_b),
-        label("Pageout"), f"[{pageout_color}]{pageout_mbps:.1f} MB/s[/]",
-        "", "",
-    )
-
     if history:
         out_vals = history.get("swapout", ())
         cmp_vals = history.get("compress", ())
@@ -589,22 +575,42 @@ def build_layout(
         cmp_peak = max(cmp_vals) if cmp_vals else 0.0
         out_color = "red bold" if out_peak > 0 else "dim"
         cmp_color = "yellow" if cmp_peak > 0 else "dim"
-        pressure_t.add_row(
-            label("Swap pk"), f"[{out_color}]{out_peak:.0f} pg/s[/]",
-            label("Cmp pk"), f"[{cmp_color}]{cmp_peak:.1f} MB/s[/]",
-            label("Window"), f"{len(out_vals)} pts",
-        )
+        swap_pk_s = f"[{out_color}]{out_peak:.0f} pg/s[/]"
+        cmp_pk_s = f"[{cmp_color}]{cmp_peak:.1f} MB/s[/]"
+        window_s = f"{len(out_vals)} pts"
+    else:
+        swap_pk_s = cmp_pk_s = window_s = "[dim]—[/]"
+
+    pressure_t = Table(
+        expand=True, show_edge=False, box=box.SIMPLE_HEAD,
+        border_style="white", header_style="bold white",
+    )
+    for col_name in (
+        "Pressure", "Compress", "Decompress", "Purgeable", "Pageout",
+        "Swap pk", "Cmp pk", "Window",
+    ):
+        pressure_t.add_column(col_name, justify="right", no_wrap=True)
+    pressure_t.add_row(
+        f"[{pcolor}]{plabel}[/]",
+        f"{compress_mbps:.1f} MB/s",
+        f"{decompress_mbps:.1f} MB/s",
+        fmt_bytes(purgeable_b),
+        f"[{pageout_color}]{pageout_mbps:.1f} MB/s[/]",
+        swap_pk_s,
+        cmp_pk_s,
+        window_s,
+    )
 
     models_t = Table(
         expand=True, title_style="bold green",
         show_edge=False, box=box.SIMPLE_HEAD,
     )
-    models_t.add_column("Source", style="green", no_wrap=True)
-    models_t.add_column("Model", style="bold")
+    models_t.add_column("Source", justify="right", style="green", no_wrap=True)
+    models_t.add_column("Model", justify="right", style="bold")
     models_t.add_column("Size", justify="right", style="cyan")
     models_t.add_column("Resident", justify="right", style="bold yellow")
     models_t.add_column("%", justify="right")
-    models_t.add_column("Process", style="dim", no_wrap=True)
+    models_t.add_column("Process", justify="right", style="dim", no_wrap=True)
     models_t.add_column("PID", justify="right", style="dim")
     if models:
         shown = models[:10]
@@ -653,11 +659,12 @@ def build_layout(
     proc_t = Table(expand=True, show_edge=False, box=box.SIMPLE_HEAD)
     proc_t.add_column("PID", justify="right", style="dim", no_wrap=True, width=7)
     proc_t.add_column(
-        "Name", style="cyan", no_wrap=True, min_width=14, overflow="ellipsis"
+        "Name", justify="right", style="cyan",
+        no_wrap=True, min_width=14, overflow="ellipsis",
     )
     proc_t.add_column("RSS", justify="right", style="bold", width=9)
     proc_t.add_column("VMS", justify="right", style="dim", width=9)
-    proc_t.add_column("Cmd", overflow="ellipsis", no_wrap=True, ratio=2)
+    proc_t.add_column("Cmd", justify="right", overflow="ellipsis", no_wrap=True, ratio=2)
     for p in procs[:20]:
         proc_t.add_row(
             str(p["pid"]),
