@@ -666,25 +666,30 @@ def build_layout(
         proc_t.add_row("—", "(none)", "", "", "")
 
     footer = Text("ctrl-c to quit", justify="right", style="dim")
-    models_size = max(4, min(12, len(models) + 4))
+    models_size = max(5, min(13, len(models) + 5))
 
     title = lambda s: f"[bold white]{s}[/]"
+    pad = (1, 1, 0, 1)
     layout = Layout()
     layout.split_column(
         Layout(
-            Panel(sys_t, title=title("System Memory"), border_style="cyan"),
-            size=6, name="system",
+            Panel(sys_t, title=title("System Memory"),
+                  border_style="cyan", padding=pad),
+            size=7, name="system",
         ),
         Layout(
-            Panel(pressure_t, title=title("Memory Pressure"), border_style="yellow"),
-            size=6, name="pressure",
+            Panel(pressure_t, title=title("Memory Pressure"),
+                  border_style="yellow", padding=pad),
+            size=7, name="pressure",
         ),
         Layout(
-            Panel(models_t, title=title("Active Models"), border_style="green"),
+            Panel(models_t, title=title("Active Models"),
+                  border_style="green", padding=pad),
             size=models_size, name="models",
         ),
         Layout(
-            Panel(proc_t, title=title("Matching Processes"), border_style="magenta"),
+            Panel(proc_t, title=title("Matching Processes"),
+                  border_style="magenta", padding=pad),
             name="procs",
         ),
         Layout(footer, size=1, name="footer"),
