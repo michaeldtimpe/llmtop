@@ -31,13 +31,12 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Deque
 
 import psutil
-from rich.console import Console, Group
+from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -52,7 +51,6 @@ DEFAULT_PATTERNS = [
 ]
 MODEL_EXTS = (".safetensors", ".gguf", ".mlx")
 HIST_LEN = 40
-SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 
 
 def vm_stat() -> dict[str, int]:
@@ -487,19 +485,6 @@ def pages_to_bytes(pages: int) -> int:
     return pages * PAGE_SIZE
 
 
-def sparkline(vals: Iterable[float], width: int = HIST_LEN) -> str:
-    """Render an iterable of non-negative values as Unicode block glyphs,
-    autoscaled to the series max. Returns ``" " * width`` for an empty series."""
-    vs = list(vals)[-width:]
-    if not vs:
-        return " " * width
-    mx = max(vs)
-    if mx <= 0:
-        return SPARK_BLOCKS[0] * len(vs)
-    last = len(SPARK_BLOCKS) - 1
-    return "".join(SPARK_BLOCKS[min(last, int(v / mx * last))] for v in vs)
-
-
 def collect(prev: dict, dt: float) -> dict:
     vm = vm_stat()
     swap = swap_usage()
@@ -597,32 +582,17 @@ def build_layout(
     )
 
     if history:
-        out_vals = list(history.get("swapout", ()))
-        cmp_vals = list(history.get("compress", ()))
-        out_cur = out_vals[-1] if out_vals else 0.0
+        out_vals = history.get("swapout", ())
+        cmp_vals = history.get("compress", ())
         out_peak = max(out_vals) if out_vals else 0.0
-        cmp_cur = cmp_vals[-1] if cmp_vals else 0.0
         cmp_peak = max(cmp_vals) if cmp_vals else 0.0
-        out_color = "red" if out_peak > 0 else "dim"
+        out_color = "red bold" if out_peak > 0 else "dim"
         cmp_color = "yellow" if cmp_peak > 0 else "dim"
-
-        trend_t = Table.grid(padding=(0, 2), expand=False)
-        trend_t.add_column(justify="right", no_wrap=True)
-        trend_t.add_column(no_wrap=True)
-        trend_t.add_column(no_wrap=True, style="dim")
-        trend_t.add_row(
-            label("Swap out"),
-            f"[{out_color}]{sparkline(out_vals)}[/]",
-            f"{out_cur:>5.0f} pg/s · peak {out_peak:.0f} ({len(out_vals)} pts)",
+        pressure_t.add_row(
+            label("Swap pk"), f"[{out_color}]{out_peak:.0f} pg/s[/]",
+            label("Cmp pk"), f"[{cmp_color}]{cmp_peak:.1f} MB/s[/]",
+            label("Window"), f"{len(out_vals)} pts",
         )
-        trend_t.add_row(
-            label("Compress"),
-            f"[{cmp_color}]{sparkline(cmp_vals)}[/]",
-            f"{cmp_cur:>5.1f} MB/s · peak {cmp_peak:.1f}",
-        )
-        pressure_body: Group | Table = Group(pressure_t, trend_t)
-    else:
-        pressure_body = pressure_t
 
     models_t = Table(expand=True, title_style="bold green", show_edge=False)
     models_t.add_column("Source", style="green", no_wrap=True)
@@ -706,8 +676,8 @@ def build_layout(
             size=6, name="system",
         ),
         Layout(
-            Panel(pressure_body, title=title("Memory Pressure"), border_style="yellow"),
-            size=7, name="pressure",
+            Panel(pressure_t, title=title("Memory Pressure"), border_style="yellow"),
+            size=6, name="pressure",
         ),
         Layout(
             Panel(models_t, title=title("Active Models"), border_style="green"),
