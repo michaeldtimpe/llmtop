@@ -198,8 +198,9 @@ def omlx_models() -> list[dict]:
 _size_cache: dict[str, int] = {}
 
 
-def model_id_from_path(path: Path) -> str:
-    """Derive a stable model id from a weight-file path.
+def model_id_from_path(path: Path) -> str | None:
+    """Derive a stable model id from a weight-file path, or None if it can't
+    be attributed to a model (e.g. lives in a content-addressable shard dir).
 
     Handles HF cache (``models--org--repo/snapshots/<hash>/<file>``),
     omlx-style flat dirs, and single-file ggufs.
@@ -209,11 +210,12 @@ def model_id_from_path(path: Path) -> str:
             return ancestor.name.removeprefix("models--").replace("--", "/")
     parent = path.parent
     parent_name = parent.name
-    is_hashlike = (
-        len(parent_name) >= 32
-        and all(c in "0123456789abcdef" for c in parent_name)
-    )
-    if parent_name == "snapshots" or is_hashlike:
+    if not parent_name:
+        return None
+    is_hex = all(c in "0123456789abcdef" for c in parent_name.lower())
+    if is_hex and len(parent_name) <= 4:
+        return None
+    if parent_name == "snapshots" or (is_hex and len(parent_name) >= 32):
         return parent.parent.name
     if path.suffix.lower() == ".gguf":
         return path.name
@@ -228,7 +230,7 @@ def detect_open_model_files(p: dict) -> list[dict]:
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         return []
 
-    by_model: dict[str, dict] = {}
+    by_model: dict[str, int] = {}
     for f in files:
         path = Path(f.path)
         if path.suffix.lower() not in MODEL_EXTS:
@@ -240,20 +242,25 @@ def detect_open_model_files(p: dict) -> list[dict]:
         if size < 50 * 1024 * 1024:
             continue
         mid = model_id_from_path(path)
-        entry = by_model.setdefault(mid, {"size": 0, "files": 0})
-        entry["size"] += size
-        entry["files"] += 1
+        if mid is None:
+            continue
+        by_model[mid] = by_model.get(mid, 0) + size
 
+    if not by_model:
+        return []
+
+    total = sum(by_model.values())
+    rss = p["rss"]
     return [
         {
             "source": p["name"],
             "model": mid,
-            "size": data["size"],
-            "resident": p["rss"],
+            "size": size,
+            "resident": min(size, rss * size // total),
             "proc": p["name"],
             "pid": p["pid"],
         }
-        for mid, data in by_model.items()
+        for mid, size in by_model.items()
     ]
 
 
