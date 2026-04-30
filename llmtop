@@ -210,6 +210,8 @@ class ProcScanner:
                 if not any(pat in (name + " " + cmd).lower() for pat in self.pats):
                     continue
                 mi = p.info["memory_info"]
+                if mi is None:
+                    continue
                 new_cache[p.info["pid"]] = {
                     "pid": p.info["pid"],
                     "name": name,
