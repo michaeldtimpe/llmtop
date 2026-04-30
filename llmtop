@@ -353,17 +353,33 @@ def model_id_from_path(path: Path) -> str | None:
     return parent_name
 
 
+def _lsof_paths(pid: int) -> list[str]:
+    """Files opened or mmap'd by ``pid``. Uses ``lsof`` because on macOS
+    ``psutil.Process.open_files()`` only reports currently-open fds, missing
+    mmap'd weights (MLX/safetensors typically open → mmap → close)."""
+    try:
+        out = subprocess.run(
+            ["lsof", "-p", str(pid), "-Fn"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    return [ln[1:] for ln in out.splitlines() if ln.startswith("n/")]
+
+
 def detect_open_model_files(p: dict) -> list[dict]:
     """Group a process's open weight files by model id."""
-    try:
-        proc = psutil.Process(p["pid"])
-        files = proc.open_files()
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-        return []
+    paths = _lsof_paths(p["pid"])
+    if not paths:
+        try:
+            proc = psutil.Process(p["pid"])
+            paths = [f.path for f in proc.open_files()]
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return []
 
     by_model: dict[str, int] = {}
-    for f in files:
-        path = Path(f.path)
+    for path_s in set(paths):
+        path = Path(path_s)
         if path.suffix.lower() not in MODEL_EXTS:
             continue
         try:
