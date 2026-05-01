@@ -86,6 +86,10 @@ When ollama or omlx are running, their local APIs supply authoritative numbers a
 - `asitop` is great for power and frequency, but doesn't track which model weights are resident.
 - `llmtop` is specifically about: *is my model in unified memory, and is it staying there?*
 
+## Security
+
+See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
+
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

@@ -3,6 +3,8 @@
 # requires-python = ">=3.11"
 # dependencies = ["psutil>=5.9", "rich>=13.7"]
 # ///
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Michael Timpe
 """llmtop — realtime memory/swap monitor for MLX & local LLM workloads on Apple Silicon.
 
 Run:
