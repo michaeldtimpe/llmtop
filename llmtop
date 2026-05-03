@@ -18,6 +18,8 @@ Run:
     ./llmtop --alert-swap-mb 1000     # macOS notification at 1GB swap used
     ./llmtop --alert-swap-rate 100    # notify on sustained swapout pages/s
     ./llmtop --alert-pressure         # notify on Warning/Critical transitions
+    ./llmtop --pane procs             # show only the matching-processes pane
+    ./llmtop --pane system --pane models  # show only those two panes
 """
 from __future__ import annotations
 
@@ -54,6 +56,7 @@ DEFAULT_PATTERNS = [
 ]
 MODEL_EXTS = (".safetensors", ".gguf", ".mlx")
 HIST_LEN = 40
+PANE_NAMES = ("system", "pressure", "models", "procs")
 
 
 def vm_stat() -> dict[str, int]:
@@ -534,7 +537,9 @@ def build_layout(
     procs: list[dict],
     models: list[dict],
     history: dict[str, Deque[float]] | None = None,
+    panes: set[str] | None = None,
 ) -> Layout:
+    panes = panes if panes is not None else set(PANE_NAMES)
     vm = snap["vm"]
     swap = snap["swap"]
     total = psutil.virtual_memory().total
@@ -700,31 +705,28 @@ def build_layout(
     models_size = max(5, min(13, len(models) + 5))
 
     title = lambda s: f"[bold white]{s}[/]"
-    pad = (1, 1, 0, 1)
+    pad = (0, 1, 0, 1)
+    specs: list[tuple[str, Panel, int | None]] = [
+        ("system", Panel(sys_t, title=title("System Memory"),
+                         border_style="cyan", padding=pad), 5),
+        ("pressure", Panel(pressure_t, title=title("Memory Pressure"),
+                           border_style="yellow", padding=pad), 6),
+        ("models", Panel(models_t, title=title("Active Models"),
+                         border_style="green", padding=pad), models_size),
+        ("procs", Panel(proc_t, title=title("Matching Processes"),
+                        border_style="magenta", padding=pad), None),
+    ]
+    shown = [s for s in specs if s[0] in panes]
+    children = []
+    for i, (name, panel, size) in enumerate(shown):
+        is_last = i == len(shown) - 1
+        if is_last or size is None:
+            children.append(Layout(panel, name=name))
+        else:
+            children.append(Layout(panel, size=size, name=name))
+    children.append(Layout(footer, size=1, name="footer"))
     layout = Layout()
-    layout.split_column(
-        Layout(
-            Panel(sys_t, title=title("System Memory"),
-                  border_style="cyan", padding=pad),
-            size=5, name="system",
-        ),
-        Layout(
-            Panel(pressure_t, title=title("Memory Pressure"),
-                  border_style="yellow", padding=pad),
-            size=6, name="pressure",
-        ),
-        Layout(
-            Panel(models_t, title=title("Active Models"),
-                  border_style="green", padding=pad),
-            size=models_size, name="models",
-        ),
-        Layout(
-            Panel(proc_t, title=title("Matching Processes"),
-                  border_style="magenta", padding=pad),
-            name="procs",
-        ),
-        Layout(footer, size=1, name="footer"),
-    )
+    layout.split_column(*children)
     return layout
 
 
@@ -823,9 +825,15 @@ def main() -> int:
                     help="notify when swapout rate (pages/s) stays above N for ~5 ticks")
     ap.add_argument("--alert-pressure", action="store_true",
                     help="notify on transition into Warning/Critical pressure")
+    ap.add_argument(
+        "--pane", action="append", default=[], choices=list(PANE_NAMES),
+        metavar="NAME",
+        help=f"show only this pane (repeatable; choices: {', '.join(PANE_NAMES)}; default: all)",
+    )
     args = ap.parse_args()
 
     patterns = args.match or DEFAULT_PATTERNS
+    panes = set(args.pane) if args.pane else set(PANE_NAMES)
     console = Console()
 
     csv_file = csv_w = None
@@ -914,7 +922,7 @@ def main() -> int:
             with Live(console=console, refresh_per_second=4, screen=True) as live:
                 while True:
                     snap, procs, models = tick()
-                    live.update(build_layout(snap, procs, models, history))
+                    live.update(build_layout(snap, procs, models, history, panes))
     finally:
         if csv_file:
             csv_file.close()

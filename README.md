@@ -44,6 +44,8 @@ Requires Python ≥ 3.11 and macOS (relies on `vm_stat` and `sysctl`). Built and
 ./llmtop --log run.csv              # also append CSV alongside the TUI
 ./llmtop --jsonl run.jsonl          # also append JSONL
 ./llmtop --no-tui --log run.csv     # headless logger (great for benchmarks)
+./llmtop --pane procs               # show only the matching-processes pane
+./llmtop --pane system --pane models  # show only those two panes
 ```
 
 ### Flags
@@ -55,6 +57,7 @@ Requires Python ≥ 3.11 and macOS (relies on `vm_stat` and `sysctl`). Built and
 | `--log PATH` | Append a CSV row per sample (one column per metric). |
 | `--jsonl PATH` | Append a JSON object per sample (full process + model breakdown). |
 | `--no-tui` | Skip the TUI; print a one-line summary per tick. Use with `--log`/`--jsonl` for unattended runs. |
+| `--pane NAME` | Show only this pane. Repeatable. Choices: `system`, `pressure`, `models`, `procs`. Defaults to all four. |
 
 `ctrl-c` exits cleanly and flushes the log files.
 
