@@ -296,14 +296,13 @@ def omlx_models() -> list[dict]:
         settings = json.loads(settings_path.read_text())
     except (OSError, json.JSONDecodeError):
         return []
-    api_key = settings.get("auth", {}).get("api_key", "")
+    api_key = settings.get("auth", {}).get("api_key") or ""
     port = settings.get("server", {}).get("port", 8000)
-    if not api_key:
-        return []
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/v1/models/status",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
         )
         with urllib.request.urlopen(req, timeout=0.5) as r:
             data = json.loads(r.read())
