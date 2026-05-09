@@ -606,10 +606,7 @@ def build_layout(
     else:
         swap_pk_s = cmp_pk_s = window_s = "[dim]—[/]"
 
-    pressure_t = Table(
-        expand=True, show_edge=False, box=box.SIMPLE_HEAD,
-        border_style="white", header_style="bold white",
-    )
+    pressure_t = Table(expand=True, show_edge=False, box=box.SIMPLE_HEAD)
     for col_name in (
         "Pressure", "Compress", "Decompress", "Purgeable", "Pageout",
         "Swap pk", "Cmp pk", "Window",
