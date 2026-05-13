@@ -11,7 +11,7 @@ use crate::tui::style;
 // Width of the label slot inside each cell. Values start at this offset so
 // every cell's value aligns vertically with the cells in the rows above
 // and below — assuming all rows use the same horizontal split.
-const CELL_LABEL_WIDTH: usize = 9; // longest label: "gpu-wired"
+const CELL_LABEL_WIDTH: usize = 8; // longest labels: "inactive", "pressure"
 
 /// Three-row × five-cell grid. Each row is laid out with
 /// `Layout::horizontal([Ratio(1,5); 5])`, so the cells stretch to fill the
@@ -61,40 +61,48 @@ fn plain_cell(label: &'static str, value: String) -> Cell {
 }
 
 fn state_cells(mem: &MemorySample) -> Vec<Cell> {
+    // Resident memory split (state, not rates). "compress" here is the
+    // compressor's total resident footprint — distinct from row 2's "comp"
+    // which is the per-second compress rate.
     vec![
-        plain_cell("Wired", fmt_bytes(mem.wired_bytes())),
-        plain_cell("Active", fmt_bytes(mem.active_bytes())),
-        plain_cell("Inactive", fmt_bytes(mem.inactive_bytes())),
-        plain_cell("Free", fmt_bytes(mem.free_bytes())),
-        plain_cell("Comp", fmt_bytes(mem.compressor_bytes())),
+        plain_cell("wired", fmt_bytes(mem.wired_bytes())),
+        plain_cell("active", fmt_bytes(mem.active_bytes())),
+        plain_cell("inactive", fmt_bytes(mem.inactive_bytes())),
+        plain_cell("free", fmt_bytes(mem.free_bytes())),
+        plain_cell("compress", fmt_bytes(mem.compressor_bytes())),
     ]
 }
 
 fn rate_cells(mem: &MemorySample) -> Vec<Cell> {
     let ps = mem.page_size;
+    // Per-second rates only. "comp" is the compress rate (paired with
+    // "decomp" decompress rate); swap in/out flank pageout.
     vec![
-        plain_cell("Compress", fmt_rate_bytes(mem.compress_rate, ps)),
-        plain_cell("Decomp", fmt_rate_bytes(mem.decompress_rate, ps)),
-        plain_cell("Pageout", fmt_rate_bytes(mem.pageout_rate, ps)),
-        plain_cell("Out/s", fmt_rate_bytes(mem.swapout_rate, ps)),
-        plain_cell("In/s", fmt_rate_bytes(mem.swapin_rate, ps)),
+        plain_cell("comp", fmt_rate_bytes(mem.compress_rate, ps)),
+        plain_cell("decomp", fmt_rate_bytes(mem.decompress_rate, ps)),
+        plain_cell("in/s", fmt_rate_bytes(mem.swapin_rate, ps)),
+        plain_cell("out/s", fmt_rate_bytes(mem.swapout_rate, ps)),
+        plain_cell("pageout", fmt_rate_bytes(mem.pageout_rate, ps)),
     ]
 }
 
 fn status_cells(mem: &MemorySample) -> Vec<Cell> {
     let pressure_str = mem.pressure.to_string();
     let pressure_color = style::pressure_color(&pressure_str);
+    // Cumulative counters and the GPU wired-memory limit. Row-3 "wired" is
+    // the iogpu.wired_limit_mb sysctl ceiling — same word as row-1 "wired"
+    // but a different concept (limit vs current resident wired bytes).
     vec![
         Cell {
-            label: "Pressure",
+            label: "pressure",
             value: pressure_str,
             value_style: Style::new().fg(pressure_color),
         },
-        plain_cell("Σ out", fmt_count(mem.raw.swapouts)),
         plain_cell("Σ in", fmt_count(mem.raw.swapins)),
-        plain_cell("Purge", fmt_bytes(mem.purgeable_bytes())),
+        plain_cell("Σ out", fmt_count(mem.raw.swapouts)),
+        plain_cell("purge", fmt_bytes(mem.purgeable_bytes())),
         plain_cell(
-            "gpu-wired",
+            "wired",
             mem.iogpu_wired_limit.clone().unwrap_or_else(|| "—".into()),
         ),
     ]
