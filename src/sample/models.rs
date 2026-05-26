@@ -13,6 +13,19 @@ const NON_MODEL_STEMS: &[&str] = &[
     "readme", "license", "notice", "changelog", "tokenizer", "config",
 ];
 
+// Cmdline flags whose value is treated as a model identifier (HuggingFace-style
+// `org/repo`). Covers mlx-lm, mlx-vlm, vllm, llama.cpp, and common user scripts.
+const MODEL_FLAGS: &[&str] = &[
+    "--model",
+    "-m",
+    "--model-name",
+    "--model-path",
+    "--model-id",
+    "--repo-id",
+    "--hf-model",
+    "--hf-repo",
+];
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelSource {
@@ -95,7 +108,7 @@ impl ModelDetector {
             }
         }
 
-        // Cmdline-based detection
+        // Cmdline-based detection: explicit model file paths.
         for proc in procs {
             for arg in &proc.cmd {
                 if looks_like_model_path(arg) {
@@ -110,6 +123,37 @@ impl ModelDetector {
                             pid: Some(proc.pid),
                         },
                     );
+                }
+            }
+        }
+
+        // Cmdline-based detection: HuggingFace repo ids passed via known flags.
+        // Handles both `--model foo/bar` and `--model=foo/bar`. We anchor on the
+        // flag (not on bare `org/repo` tokens) to avoid false positives from
+        // unrelated paths or option values that happen to contain a slash.
+        for proc in procs {
+            for (idx, arg) in proc.cmd.iter().enumerate() {
+                let candidate = if let Some(value) = strip_model_flag_eq(arg) {
+                    Some(value)
+                } else if MODEL_FLAGS.iter().any(|f| *f == arg.as_str()) {
+                    proc.cmd.get(idx + 1).map(|s| s.as_str())
+                } else {
+                    None
+                };
+                if let Some(c) = candidate {
+                    if looks_like_hf_repo_id(c) {
+                        push_unique(
+                            &mut models,
+                            ModelEntry {
+                                source: ModelSource::Cmdline,
+                                model_id: c.to_string(),
+                                size_bytes: None,
+                                resident_bytes: None,
+                                process_name: Some(proc.name.clone()),
+                                pid: Some(proc.pid),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -184,4 +228,45 @@ fn looks_like_model_path(arg: &str) -> bool {
         return false;
     }
     true
+}
+
+// If `arg` is `<flag>=<value>` for any known model flag, return `<value>`.
+fn strip_model_flag_eq(arg: &str) -> Option<&str> {
+    for f in MODEL_FLAGS {
+        if let Some(rest) = arg.strip_prefix(f) {
+            if let Some(value) = rest.strip_prefix('=') {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+// HuggingFace repo ids look like `org/repo` (e.g. `mlx-community/Qwen2.5-VL-7B-Instruct-4bit`).
+// Reject anything that looks like a flag, a local path, a URL, or an
+// extension-bearing file (those are handled by the path scanner).
+fn looks_like_hf_repo_id(arg: &str) -> bool {
+    if arg.is_empty()
+        || arg.starts_with('-')
+        || arg.starts_with('/')
+        || arg.starts_with('.')
+        || arg.starts_with('~')
+    {
+        return false;
+    }
+    if arg.contains("://") {
+        return false;
+    }
+    if arg.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+    if looks_like_model_path(arg) {
+        return false;
+    }
+    let parts: Vec<&str> = arg.split('/').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return false;
+    }
+    let valid_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    parts.iter().all(|p| p.chars().all(valid_char))
 }
