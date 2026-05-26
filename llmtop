@@ -46,17 +46,44 @@ from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
 PAGE_SIZE = 16384  # Apple Silicon
 DEFAULT_PATTERNS = [
     "python", "mlx", "omlx", "ollama", "llama",
-    "lm-studio", "lmstudio", "vllm",
+    "lm-studio", "lmstudio", "lm studio", "vllm",
     "text-generation-inference", "tgi", "candle",
 ]
 MODEL_EXTS = (".safetensors", ".gguf", ".mlx")
 HIST_LEN = 40
 PANE_NAMES = ("system", "pressure", "models", "procs")
+HF_HUB_DIR = Path.home() / ".cache" / "huggingface" / "hub"
+
+# Library-path signatures for in-process inference runtimes. Used when a proc
+# has loaded weights into Metal/RAM and closed the weight fd (lsof finds no
+# .safetensors/.gguf), but the engine's dylibs/extensions are still mapped.
+ENGINE_LIB_SIGS: list[tuple[str, re.Pattern[str]]] = [
+    ("mlx", re.compile(r"/mlx/lib/|mlx\.metallib|libmlx\.dylib")),
+    ("llama.cpp", re.compile(r"libllama\.(?:dylib|so)|libggml")),
+    ("vllm", re.compile(r"/site-packages/vllm/")),
+    ("torch", re.compile(r"/torch/lib/(?:libtorch|libc10)")),
+]
+
+
+def _script_version() -> str:
+    """Short git rev of the script's own checkout, with -dirty if modified."""
+    try:
+        script_dir = Path(__file__).resolve().parent
+        out = subprocess.run(
+            ["git", "-C", str(script_dir), "describe",
+             "--always", "--dirty", "--abbrev=7"],
+            capture_output=True, text=True, timeout=1,
+        ).stdout.strip()
+        return out or "dev"
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return "dev"
+
+
+VERSION = _script_version()
 
 
 def vm_stat() -> dict[str, int]:
@@ -371,15 +398,102 @@ def _lsof_paths(pid: int) -> list[str]:
     return [ln[1:] for ln in out.splitlines() if ln.startswith("n/")]
 
 
-def detect_open_model_files(p: dict) -> list[dict]:
-    """Group a process's open weight files by model id."""
+def detect_engine_from_libs(paths: list[str]) -> str | None:
+    """Identify the inference runtime from a proc's mapped libraries.
+
+    Used as a signal that the proc is an in-process model host even when no
+    weight files appear in lsof (e.g. MLX reads safetensors → Metal heap →
+    closes the fd, so the weight file is no longer mapped).
+
+    Iterates engines in declared priority order — a process can have both
+    mlx and torch libs mapped (torchvision pulls in libtorch) and we want the
+    real inference runtime, not an incidental dep."""
+    for engine, pat in ENGINE_LIB_SIGS:
+        if any(pat.search(path) for path in paths):
+            return engine
+    return None
+
+
+def _hf_dir_size(d: Path) -> int:
+    try:
+        return sum(
+            f.stat().st_size for f in d.rglob("*")
+            if f.is_file() and f.suffix.lower() in (".safetensors", ".gguf", ".mlx", ".bin")
+        )
+    except OSError:
+        return 0
+
+
+def _hf_repo_from_dirname(name: str) -> str:
+    return name.removeprefix("models--").replace("--", "/")
+
+
+_HF_PATH_RE = re.compile(r"/huggingface/hub/(models--[^/]+)/")
+
+
+def hf_model_for_proc(
+    pid: int, paths: list[str], proc_start: float
+) -> tuple[str, int] | None:
+    """Best-guess (model_id, size_on_disk) for an in-process load.
+
+    Tries, in order:
+      1. An open file under a `models--<repo>/` dir (config.json, tokenizer,
+         xet metadata — anything still held by the runtime).
+      2. The most recently *accessed* `models--*` dir whose atime is ≥ the
+         proc's start time. The proc itself bumps the dir's atime when it
+         walks the snapshot, so this picks the loaded model in practice.
+    """
+    for p in paths:
+        m = _HF_PATH_RE.search(p)
+        if m:
+            d = HF_HUB_DIR / m.group(1)
+            return _hf_repo_from_dirname(m.group(1)), _hf_dir_size(d)
+
+    try:
+        entries = list(HF_HUB_DIR.iterdir())
+    except OSError:
+        return None
+    best: tuple[float, Path] | None = None
+    for entry in entries:
+        if not entry.name.startswith("models--") or not entry.is_dir():
+            continue
+        try:
+            atime = entry.stat().st_atime
+        except OSError:
+            continue
+        if atime < proc_start:
+            continue
+        if best is None or atime > best[0]:
+            best = (atime, entry)
+    if best is None:
+        return None
+    return _hf_repo_from_dirname(best[1].name), _hf_dir_size(best[1])
+
+
+def _proc_start_time(pid: int) -> float:
+    try:
+        return psutil.Process(pid).create_time()
+    except _PROC_GONE:
+        return 0.0
+
+
+def attribute_proc(p: dict) -> list[dict]:
+    """Return model entries attributed to proc ``p``.
+
+    Three strategies, most specific first:
+      1. Open weight files (.safetensors/.gguf/.mlx) found via lsof —
+         authoritative when the runtime keeps weights mmap'd.
+      2. Engine signature + HF-cache recency — covers in-process Python
+         loads where the weight fd was closed after copy to Metal/RAM
+         (typical MLX / mlx-vlm / transformers workloads).
+      3. Cmdline parsing for --model/--hf-repo/--model-path flags."""
     paths = _lsof_paths(p["pid"])
     if not paths:
         try:
             proc = psutil.Process(p["pid"])
             paths = [f.path for f in proc.open_files()]
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            return []
+        except _PROC_GONE:
+            paths = []
 
     by_model: dict[str, int] = {}
     for path_s in set(paths):
@@ -397,22 +511,63 @@ def detect_open_model_files(p: dict) -> list[dict]:
             continue
         by_model[mid] = by_model.get(mid, 0) + size
 
-    if not by_model:
-        return []
+    if by_model:
+        total = sum(by_model.values())
+        rss = p["rss"]
+        return [
+            {
+                "source": p["name"],
+                "model": mid,
+                "size": size,
+                "resident": min(size, rss * size // total),
+                "proc": p["name"],
+                "pid": p["pid"],
+            }
+            for mid, size in by_model.items()
+        ]
 
-    total = sum(by_model.values())
-    rss = p["rss"]
-    return [
-        {
-            "source": p["name"],
-            "model": mid,
-            "size": size,
-            "resident": min(size, rss * size // total),
-            "proc": p["name"],
-            "pid": p["pid"],
-        }
-        for mid, size in by_model.items()
-    ]
+    engine = detect_engine_from_libs(paths)
+    if engine:
+        guess = hf_model_for_proc(p["pid"], paths, _proc_start_time(p["pid"]))
+        if guess:
+            model, size = guess
+            return [{
+                "source": engine,
+                "model": model,
+                "size": size,
+                "resident": min(p["rss"], size) if size else p["rss"],
+                "proc": p["name"],
+                "pid": p["pid"],
+            }]
+        if p["rss"] > 500 * 1024 * 1024:
+            token = None
+            m = _MODEL_FLAG_RE.search(p["cmd"])
+            if m:
+                token = m.group(1).strip("\"'")
+            return [{
+                "source": engine,
+                "model": token or "(in-process)",
+                "size": 0,
+                "resident": p["rss"],
+                "proc": p["name"],
+                "pid": p["pid"],
+            }]
+
+    ext = extract_model_from_cmdline(p["cmd"])
+    if not ext:
+        return []
+    mid, path = ext
+    if path is not None and path not in _size_cache:
+        _size_cache[path] = _file_size(path)
+    size = _size_cache.get(path, 0) if path else 0
+    return [{
+        "source": p["name"],
+        "model": mid,
+        "size": size,
+        "resident": p["rss"],
+        "proc": p["name"],
+        "pid": p["pid"],
+    }]
 
 
 def collect_models(
@@ -464,33 +619,11 @@ def collect_models(
         )
 
     by_model: dict[str, dict] = {}
-
     for p in procs:
-        detected = detect_open_model_files(p)
-        if detected:
-            for entry in detected:
-                cur = by_model.get(entry["model"])
-                if cur is None or entry["resident"] > cur["resident"]:
-                    by_model[entry["model"]] = entry
-            continue
-
-        ext = extract_model_from_cmdline(p["cmd"])
-        if not ext:
-            continue
-        mid, path = ext
-        if path is not None and path not in _size_cache:
-            _size_cache[path] = _file_size(path)
-        size = _size_cache.get(path, 0) if path else 0
-        cur = by_model.get(mid)
-        if cur is None or p["rss"] > cur["resident"]:
-            by_model[mid] = {
-                "source": p["name"],
-                "model": mid,
-                "size": size,
-                "resident": p["rss"],
-                "proc": p["name"],
-                "pid": p["pid"],
-            }
+        for entry in attribute_proc(p):
+            cur = by_model.get(entry["model"])
+            if cur is None or entry["resident"] > cur["resident"]:
+                by_model[entry["model"]] = entry
 
     out.extend(by_model.values())
     return sorted(out, key=lambda x: -max(x["size"], x["resident"]))
@@ -697,7 +830,10 @@ def build_layout(
     if not procs:
         proc_t.add_row("—", "(none)", "", "", "")
 
-    footer = Text("ctrl-c to quit", justify="right", style="dim")
+    footer = Table.grid(expand=True)
+    footer.add_column(justify="left", ratio=1)
+    footer.add_column(justify="right", ratio=1)
+    footer.add_row(f"[dim]llmtop {VERSION}[/]", "[dim]ctrl-c to quit[/]")
     models_size = max(5, min(13, len(models) + 5))
 
     title = lambda s: f"[bold white]{s}[/]"

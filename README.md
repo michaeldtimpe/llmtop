@@ -13,9 +13,12 @@ A realtime memory, swap, and model-residency monitor for **MLX** and other local
 - **Active models** — unified view of resident models, with size on disk vs. resident memory and a residency `%`. Pulled from:
   - the **ollama** local API (`/api/ps` on `127.0.0.1:11434`),
   - the **omlx** local API (`/v1/models/status`, using the API key in `~/.omlx/settings.json`),
-  - **per-process open file descriptors** for `.safetensors` / `.gguf` / `.mlx` weights (authoritative — works for `mlx_lm`, `vllm`, `llama.cpp`, LM Studio, etc.),
+  - the **LM Studio** local API (`/api/v0/models` on `127.0.0.1:1234`, override with `LMSTUDIO_PORT`),
+  - **per-process open file descriptors** for `.safetensors` / `.gguf` / `.mlx` weights (authoritative — works for `mlx_lm`, `vllm`, `llama.cpp`, LM Studio's helper process, etc.),
+  - **in-process MLX / PyTorch / llama.cpp / vLLM loads** detected from mapped engine libraries (`libmlx.dylib`, `libtorch*`, `libllama`, …), then attributed to the most recently accessed HuggingFace cache snapshot. Covers the common case where Python reads safetensors into the Metal heap and immediately closes the fd.
   - process command-line as a fallback.
 - **Matching processes** — top-N by RSS, filtered by name/cmdline patterns.
+- **Footer** — short git rev of the running `llmtop` checkout (`-dirty` if there are local edits).
 
 ## Install
 
@@ -53,7 +56,7 @@ Requires Python ≥ 3.11 and macOS (relies on `vm_stat` and `sysctl`). Built and
 | Flag | Description |
 | --- | --- |
 | `-i`, `--interval` | Sample interval in seconds (default `1.0`). |
-| `-m`, `--match` | Substring to match against process name + cmdline. Repeatable. Defaults: `python, mlx, omlx, ollama, llama, lm-studio, lmstudio, vllm`. |
+| `-m`, `--match` | Substring to match against process name + cmdline. Repeatable. Defaults: `python, mlx, omlx, ollama, llama, lm-studio, lmstudio, lm studio, vllm, text-generation-inference, tgi, candle`. |
 | `--log PATH` | Append a CSV row per sample (one column per metric). |
 | `--jsonl PATH` | Append a JSON object per sample (full process + model breakdown). |
 | `--no-tui` | Skip the TUI; print a one-line summary per tick. Use with `--log`/`--jsonl` for unattended runs. |
@@ -73,15 +76,18 @@ One object per sample, including the full top-8 process list and every detected 
 
 ## How model detection works
 
-For each matched process, `llmtop` inspects `/proc`-style open file descriptors via `psutil` and groups any open `.safetensors` / `.gguf` / `.mlx` files (≥ 50 MB) by a derived **model id**:
+For each matched process, `llmtop` tries three strategies in order, most specific first:
 
-- HuggingFace cache layout (`models--org--repo/snapshots/<hash>/<file>`) → `org/repo`.
-- Single-file ggufs → filename.
-- Otherwise → containing directory name.
+1. **Open weight files via `lsof`.** Groups `.safetensors` / `.gguf` / `.mlx` files (≥ 50 MB) by a derived **model id**:
+   - HuggingFace cache layout (`models--org--repo/snapshots/<hash>/<file>`) → `org/repo`.
+   - Single-file ggufs → filename.
+   - Otherwise → containing directory name.
+2. **Engine library signature + HuggingFace cache recency.** When step 1 finds nothing (typical for MLX / `mlx-vlm` / `transformers` workloads, which read safetensors into the Metal heap and then close the file descriptor), the mapped libraries are scanned for `libmlx.dylib` / `mlx.metallib` / `libtorch*` / `libllama` / `libggml` / `site-packages/vllm/`. The process's loaded model is then guessed as the `~/.cache/huggingface/hub/models--*` directory whose `atime` is most recently bumped after the process started.
+3. **Cmdline parsing.** Falls back to `--model` / `--hf-repo` / `--model-path` flags.
 
-Resident bytes are the process RSS; size on disk is the sum of weight files. Residency percent close to 100% means the model is fully paged in — anything lower (especially with active swap-outs) means parts are getting evicted.
+Resident bytes are the process RSS (or, when known, the model's on-disk size, whichever is smaller); size on disk is the sum of weight files. Residency percent close to 100% means the model is fully paged in — anything lower (especially with active swap-outs) means parts are getting evicted.
 
-When ollama or omlx are running, their local APIs supply authoritative numbers and override the heuristic for those processes.
+When ollama, omlx, or LM Studio are running, their local APIs supply authoritative numbers for the models they host.
 
 ## Why not `top`/`htop`/`asitop`?
 
