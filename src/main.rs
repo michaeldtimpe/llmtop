@@ -6,10 +6,19 @@ use llmtop::alert::{AlertConfig, Alerter};
 use llmtop::cli::Args;
 use llmtop::log::{CsvLogger, JsonlLogger};
 use llmtop::sample::{DefaultCollector, SampleCollector};
+use llmtop::tui::style::THEMES;
 use llmtop::tui::App;
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    let theme_idx = match args.theme.as_deref() {
+        Some(name) => THEMES.iter().position(|t| t.name == name).ok_or_else(|| {
+            let valid: Vec<&str> = THEMES.iter().map(|t| t.name).collect();
+            anyhow::anyhow!("unknown theme '{}'. Valid: {}", name, valid.join(", "))
+        })?,
+        None => 0,
+    };
 
     let interval = if args.once { 0.1 } else { args.interval };
     let mut collector = DefaultCollector::new(
@@ -39,7 +48,7 @@ fn main() -> Result<()> {
         return run_headless(collector, alerter, csv_logger, jsonl_logger, &args);
     }
 
-    let app = App::new(collector, args.pane, alerter, csv_logger, jsonl_logger);
+    let app = App::new(collector, args.pane, alerter, csv_logger, jsonl_logger, theme_idx);
     app.run()
 }
 

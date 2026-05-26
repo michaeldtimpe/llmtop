@@ -58,4 +58,8 @@ pub struct Args {
     /// Override omlx port
     #[arg(long)]
     pub omlx_port: Option<u16>,
+
+    /// Initial usage-bar theme (cycle through the rest with `c` at runtime)
+    #[arg(long)]
+    pub theme: Option<String>,
 }

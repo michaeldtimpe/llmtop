@@ -38,6 +38,7 @@ impl App {
         alerter: Alerter,
         csv_logger: Option<CsvLogger>,
         jsonl_logger: Option<JsonlLogger>,
+        theme_idx: usize,
     ) -> Self {
         Self {
             collector,
@@ -46,7 +47,7 @@ impl App {
             alerter,
             csv_logger,
             jsonl_logger,
-            theme_idx: 0,
+            theme_idx,
             frame: 0,
         }
     }
