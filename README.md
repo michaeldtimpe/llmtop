@@ -86,6 +86,8 @@ llmtop --theme llmtop               # pick the initial usage-bar theme
 
 4. **Cmdline HF flags.** The cmdline is scanned for known model flags whose value is a HuggingFace-style repo id (`org/repo`). Recognized flags: `--model`, `--model-name`, `--model-id`, `--model-path`, `--repo-id`, `--hf-model`, `--hf-repo`, and the short form `-m`. Both `--flag value` and `--flag=value` are accepted. The value must contain exactly one `/`, with both halves non-empty and using only `[A-Za-z0-9._-]`; anything that looks like a flag, a local path, or a URL is rejected. This is the layer that catches MLX/`mlx-vlm`/`transformers` workloads which read safetensors into the Metal heap and then close the file descriptor — i.e. the cases where layer 2 has nothing to attribute.
 
+For sources 3 and 4 the on-disk size is unknown, so `size_bytes` is left empty. `resident_bytes` is filled with the matched process's RSS — unless source 2 already produced a per-file entry for the same pid, in which case those per-file numbers win and the cmdline entry stays empty to avoid double-counting in the TOTAL row.
+
 Residency percent close to 100% means the model is fully paged in — anything lower (especially with active swap-outs) means parts are getting evicted.
 
 ## Output schemas
@@ -101,7 +103,7 @@ Residency percent close to 100% means the model is fully paged in — anything l
     { "source": "cmdline",
       "model_id": "mlx-community/Qwen2.5-VL-7B-Instruct-4bit",
       "size_bytes": null,
-      "resident_bytes": null,
+      "resident_bytes": 8323858432,
       "process_name": "Python",
       "pid": 95462 }
   ]

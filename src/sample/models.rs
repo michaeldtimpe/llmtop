@@ -110,6 +110,11 @@ impl ModelDetector {
 
         // Cmdline-based detection: explicit model file paths.
         for proc in procs {
+            // If Files-source detection already produced an entry for this
+            // pid, that path-level RSS is more accurate than process RSS.
+            // Otherwise attribute the whole process RSS to the cmdline model
+            // (close enough for single-model serving processes like mlx-lm).
+            let resident = cmdline_resident_for(&models, proc);
             for arg in &proc.cmd {
                 if looks_like_model_path(arg) {
                     push_unique(
@@ -118,7 +123,7 @@ impl ModelDetector {
                             source: ModelSource::Cmdline,
                             model_id: model_id_from_path(arg),
                             size_bytes: None,
-                            resident_bytes: None,
+                            resident_bytes: resident,
                             process_name: Some(proc.name.clone()),
                             pid: Some(proc.pid),
                         },
@@ -132,6 +137,7 @@ impl ModelDetector {
         // flag (not on bare `org/repo` tokens) to avoid false positives from
         // unrelated paths or option values that happen to contain a slash.
         for proc in procs {
+            let resident = cmdline_resident_for(&models, proc);
             for (idx, arg) in proc.cmd.iter().enumerate() {
                 let candidate = if let Some(value) = strip_model_flag_eq(arg) {
                     Some(value)
@@ -148,7 +154,7 @@ impl ModelDetector {
                                 source: ModelSource::Cmdline,
                                 model_id: c.to_string(),
                                 size_bytes: None,
-                                resident_bytes: None,
+                                resident_bytes: resident,
                                 process_name: Some(proc.name.clone()),
                                 pid: Some(proc.pid),
                             },
@@ -189,6 +195,21 @@ fn push_unique(models: &mut Vec<ModelEntry>, entry: ModelEntry) {
 // and `/Volumes/External/qwen3.gguf` could be different quantizations.
 fn same_model(a: &ModelEntry, b: &ModelEntry) -> bool {
     a.model_id == b.model_id
+}
+
+// Pick a resident_bytes value for a cmdline-derived model. If a Files entry
+// for the same pid already exists, return None — those per-file numbers are
+// the authoritative attribution and we don't want to double-count the RSS
+// in the TOTAL row. Otherwise the process RSS is the best signal we have.
+fn cmdline_resident_for(models: &[ModelEntry], proc: &MatchedProcess) -> Option<u64> {
+    let has_files_entry = models.iter().any(|m| {
+        matches!(m.source, ModelSource::Files) && m.pid == Some(proc.pid)
+    });
+    if has_files_entry {
+        None
+    } else {
+        Some(proc.rss_bytes)
+    }
 }
 
 fn model_id_from_path(path: &str) -> String {

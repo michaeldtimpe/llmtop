@@ -18,12 +18,17 @@ pub fn render(f: &mut Frame, area: Rect, models: &[ModelEntry], total_ram: u64) 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Fixed-width columns: source(8) + size(8) + resident(10) + gap(2) +
+    // residency bar(10) + " " + pct(4) = 43. Remaining width goes to the
+    // model id so HF-style `org/repo` names aren't aggressively truncated.
+    let model_width = (inner.width as usize).saturating_sub(43).max(16);
+
     let mut lines = Vec::new();
 
     // Header
     lines.push(Line::from(vec![
         Span::styled(format!("{:<8}", "Source"), style::LABEL),
-        Span::styled(format!("{:<24}", "Model"), style::LABEL),
+        Span::styled(format!("{:<width$}", "Model", width = model_width), style::LABEL),
         Span::styled(format!("{:>8}", "Size"), style::LABEL),
         Span::styled(format!("{:>10}", "Resident"), style::LABEL),
         Span::raw("  "),
@@ -47,10 +52,15 @@ pub fn render(f: &mut Frame, area: Rect, models: &[ModelEntry], total_ram: u64) 
         };
 
         let source_str = format!("{:?}", m.source).to_lowercase();
-        let model_display = if m.model_id.len() > 22 {
-            format!("{}…", &m.model_id[..21])
-        } else {
-            m.model_id.clone()
+        let model_display = {
+            let char_count = m.model_id.chars().count();
+            if char_count > model_width {
+                let take = model_width.saturating_sub(1);
+                let truncated: String = m.model_id.chars().take(take).collect();
+                format!("{truncated}…")
+            } else {
+                m.model_id.clone()
+            }
         };
 
         let size_str = m.size_bytes.map(fmt_bytes).unwrap_or_else(|| "—".into());
@@ -58,7 +68,7 @@ pub fn render(f: &mut Frame, area: Rect, models: &[ModelEntry], total_ram: u64) 
 
         let mut spans = vec![
             Span::styled(format!("{source_str:<8}"), style::VALUE),
-            Span::styled(format!("{model_display:<24}"), style::VALUE),
+            Span::styled(format!("{model_display:<width$}", width = model_width), style::VALUE),
             Span::styled(format!("{size_str:>8}"), style::VALUE),
             Span::styled(format!("{resident_str:>10}"), style::VALUE),
             Span::raw("  "),
@@ -83,7 +93,7 @@ pub fn render(f: &mut Frame, area: Rect, models: &[ModelEntry], total_ram: u64) 
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{:─<8}", ""), style::LABEL),
-            Span::styled(format!("{:<24}", "TOTAL"), style::HIGHLIGHT),
+            Span::styled(format!("{:<width$}", "TOTAL", width = model_width), style::HIGHLIGHT),
             Span::styled(format!("{:>8}", fmt_bytes(total_size)), style::HIGHLIGHT),
             Span::styled(format!("{:>10}", fmt_bytes(total_resident)), style::HIGHLIGHT),
             Span::raw("  "),
