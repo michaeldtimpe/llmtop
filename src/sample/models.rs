@@ -140,19 +140,31 @@ impl ModelDetector {
             }
         }
 
-        // Cmdline-based detection: HuggingFace repo ids passed via known flags.
+        // Cmdline-based detection: model identifiers passed via known flags.
         // Handles both `--model foo/bar` and `--model=foo/bar`. We anchor on the
-        // flag (not on bare `org/repo` tokens) to avoid false positives from
-        // unrelated paths or option values that happen to contain a slash.
+        // flag (not on bare tokens) to avoid false positives from unrelated paths
+        // or option values. Two identifier shapes are accepted:
+        //   - HuggingFace `org/repo` (e.g. `mlx-community/Qwen2.5-VL-7B-Instruct-4bit`)
+        //   - Bare model labels (e.g. `Qwen3.6-35B-A3B-6bit`) used by benchmark
+        //     clients that resolve the label to a server-side weight set
+        // For HF ids we keep the existing RSS attribution (typical caller is an
+        // mlx-lm/vllm server process). For bare labels we leave `resident_bytes`
+        // empty since the caller is just as likely a client (BFCL, lm-eval, …)
+        // whose RSS doesn't represent loaded weights.
         for proc in procs {
             let resident = cmdline_resident_for(&models, proc);
             for (idx, arg) in proc.cmd.iter().enumerate() {
-                let candidate = if let Some(value) = strip_model_flag_eq(arg) {
-                    Some(value)
+                // `-m` is overloaded: llama.cpp uses it for a model path/id, but
+                // python uses it for a module name. Allow `-m` to feed the HF /
+                // path scanners (a python module has no `/`, so `-m org/repo`
+                // is unambiguous) but never the bare-label scanner (a dotted
+                // python module like `pkg.subpkg.run` would otherwise match).
+                let (candidate, is_short_m) = if let Some(value) = strip_model_flag_eq(arg) {
+                    (Some(value), arg.starts_with("-m="))
                 } else if MODEL_FLAGS.iter().any(|f| *f == arg.as_str()) {
-                    proc.cmd.get(idx + 1).map(|s| s.as_str())
+                    (proc.cmd.get(idx + 1).map(|s| s.as_str()), arg == "-m")
                 } else {
-                    None
+                    (None, false)
                 };
                 if let Some(c) = candidate {
                     if looks_like_hf_repo_id(c) {
@@ -163,6 +175,18 @@ impl ModelDetector {
                                 model_id: c.to_string(),
                                 size_bytes: None,
                                 resident_bytes: resident,
+                                process_name: Some(proc.name.clone()),
+                                pid: Some(proc.pid),
+                            },
+                        );
+                    } else if !is_short_m && looks_like_bare_model_label(c) {
+                        push_unique(
+                            &mut models,
+                            ModelEntry {
+                                source: ModelSource::Cmdline,
+                                model_id: c.to_string(),
+                                size_bytes: None,
+                                resident_bytes: None,
                                 process_name: Some(proc.name.clone()),
                                 pid: Some(proc.pid),
                             },
@@ -298,4 +322,37 @@ fn looks_like_hf_repo_id(arg: &str) -> bool {
     }
     let valid_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
     parts.iter().all(|p| p.chars().all(valid_char))
+}
+
+// Bare model identifier passed via a known --model flag — no slash, no path,
+// no URL. Catches benchmark-client cmdlines like `--model Qwen3.6-35B-A3B-6bit`
+// or `--model llama-3.2-3b-instruct`. We require at least one structural char
+// (digit / `-` / `_` / `.` / `:`) so generic English words like `auto`,
+// `default`, `latest`, `none` don't get promoted into model rows.
+fn looks_like_bare_model_label(arg: &str) -> bool {
+    if arg.is_empty()
+        || arg.starts_with('-')
+        || arg.starts_with('/')
+        || arg.starts_with('.')
+        || arg.starts_with('~')
+    {
+        return false;
+    }
+    if arg.contains("://") || arg.contains('/') {
+        return false;
+    }
+    if arg.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+    if looks_like_model_path(arg) {
+        return false;
+    }
+    if arg.len() < 3 {
+        return false;
+    }
+    let valid_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':');
+    if !arg.chars().all(valid_char) {
+        return false;
+    }
+    arg.chars().any(|c| c.is_ascii_digit() || matches!(c, '-' | '_' | '.' | ':'))
 }
