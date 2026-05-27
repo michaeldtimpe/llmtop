@@ -59,6 +59,10 @@ pub struct Args {
     #[arg(long)]
     pub omlx_port: Option<u16>,
 
+    /// omlx API key (defaults to $OMLX_API_KEY). Required if the server has auth enabled.
+    #[arg(long, env = "OMLX_API_KEY", hide_env_values = true)]
+    pub omlx_api_key: Option<String>,
+
     /// Initial usage-bar theme (cycle through the rest with `c` at runtime)
     #[arg(long)]
     pub theme: Option<String>,

@@ -67,6 +67,7 @@ llmtop --theme llmtop               # pick the initial usage-bar theme
 | `--ollama-port` | Override the ollama API port (default `11434`). |
 | `--lmstudio-port` | Override the LM Studio API port (default `1234`; env `LMSTUDIO_PORT`). |
 | `--omlx-port` | Override the omlx API port (default: probe `8000`, then `5741`). |
+| `--omlx-api-key` | API key for omlx (env `OMLX_API_KEY`). Required if the server has auth enabled — without it the `/v1/models/status` probe returns 401 and llmtop silently drops the omlx source. |
 | `--theme NAME` | Initial usage-bar theme. Cycle through the rest with `c` at runtime. |
 
 `ctrl-c` exits cleanly and flushes the log files.
@@ -77,7 +78,7 @@ llmtop --theme llmtop               # pick the initial usage-bar theme
 
 1. **Local APIs** — when running, the following endpoints are queried each tick and report the canonical loaded model id and (where available) its size on disk and resident bytes:
    - **ollama** `GET /api/ps` on `127.0.0.1:11434`,
-   - **omlx** `GET /v1/models/status` on `127.0.0.1:8000` (or `5741`),
+   - **omlx** `GET /v1/models/status` on `127.0.0.1:8000` (or `5741`). If the server has auth enabled, set `OMLX_API_KEY` (or pass `--omlx-api-key`) so the probe can authenticate; otherwise it returns 401 and the omlx row is silently dropped.
    - **LM Studio** `GET /api/v0/models` (`state == "loaded"`), with fallback to `/v1/models` if v0 isn't available.
 
 2. **Per-process FFI scan.** For each matched process, `proc_pidinfo` is called twice — once to list open file descriptors (`PROC_PIDLISTFDS` → `PROC_PIDFDVNODEPATHINFO`) and once to walk the VM region map (`PROC_PIDREGIONPATHINFO`) — so we see both currently-open weight files and mmap'd-but-closed weights. Files ≥ 50 MB matching `.gguf` / `.ggml` / `.safetensors` / `.bin` are reported with their on-disk size and resident bytes (`pri_pages_resident * page_size`).
