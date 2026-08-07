@@ -83,7 +83,7 @@ For each matched process, `llmtop` tries three strategies in order, most specifi
    - Single-file ggufs → filename.
    - Otherwise → containing directory name.
 2. **Engine library signature + HuggingFace cache recency.** When step 1 finds nothing (typical for MLX / `mlx-vlm` / `transformers` workloads, which read safetensors into the Metal heap and then close the file descriptor), the mapped libraries are scanned for `libmlx.dylib` / `mlx.metallib` / `libtorch*` / `libllama` / `libggml` / `site-packages/vllm/`. The process's loaded model is then guessed as the `~/.cache/huggingface/hub/models--*` directory whose `atime` is most recently bumped after the process started.
-3. **Cmdline parsing.** Falls back to `--model` / `--hf-repo` / `--model-path` flags.
+3. **Cmdline parsing.** Falls back to model flags on the process command line. Recognized: `--model`, `--model-name`, `--model-id`, `--model-path`, `--hf-model`, `--hf-repo`, `--repo-id`, `--adapter-path`, and the short form `-m`. Both `--flag value` and `--flag=value` forms are accepted. The captured value can be a HuggingFace repo id (`org/repo`) or a local weight-file path.
 
 Resident bytes are the process RSS (or, when known, the model's on-disk size, whichever is smaller); size on disk is the sum of weight files. Residency percent close to 100% means the model is fully paged in — anything lower (especially with active swap-outs) means parts are getting evicted.
 

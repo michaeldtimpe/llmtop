@@ -266,7 +266,9 @@ class ProcScanner:
 
 
 _MODEL_FLAG_RE = re.compile(
-    r"--(?:model|hf-repo|model[-_]path|adapter[-_]path)(?:[= ]+|\s+)(\S+)"
+    r"(?:^|\s)"
+    r"(?:--(?:model-name|model-id|model[-_]path|adapter[-_]path|hf-model|hf-repo|repo-id|model)|-m)"
+    r"(?:=|\s+)(\S+)"
 )
 _MODEL_FILE_RE = re.compile(r"(\S+\.(?:gguf|safetensors|mlx))", re.IGNORECASE)
 
